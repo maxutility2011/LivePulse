@@ -84,7 +84,9 @@ class UVQ1p5Fused(nn.Module):
         self.aggregation.resizer = nn.Identity()
 
     def forward(self, frames):
-        x = frames.permute(0, 3, 1, 2).to(torch.float32)
+        # Cast before the permute: TensorRT only accepts uint8 as a network
+        # input feeding straight into a Cast, never as an intermediate tensor.
+        x = frames.to(torch.float32).permute(0, 3, 1, 2)
         x = x * (2.0 / 255.0) - 1.0
 
         # ContentNetCore: bilinear resize to 256x256 + EfficientNet -> (B, 128, 8, 8).

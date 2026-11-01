@@ -8,8 +8,8 @@ Example:
 
 Equivalent trtexec command:
     trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp16.engine --fp16 \
-        --minShapes=frames:1x1080x1920x3 --optShapes=frames:24x1080x1920x3 \
-        --maxShapes=frames:24x1080x1920x3
+        --minShapes=frames:1x1080x1920x3 --optShapes=frames:4x1080x1920x3 \
+        --maxShapes=frames:8x1080x1920x3
 """
 
 import argparse
@@ -29,8 +29,12 @@ def parse_args():
     parser.add_argument("-o", "--output", default=None, help="Engine path (default: next to the ONNX file)")
     parser.add_argument("--fp16", action="store_true", help="Allow FP16 kernels (much faster on Tensor Core GPUs)")
     parser.add_argument("--min_batch", type=int, default=1)
-    parser.add_argument("--opt_batch", type=int, default=24, help="Batch size TensorRT tunes kernels for")
-    parser.add_argument("--max_batch", type=int, default=24, help="Largest batch the engine accepts")
+    # Small defaults so the build fits 8 GB GPUs: at 1080p every frame is 9
+    # DistortionNet patches, and a batch of 24 needs > 9 GB for single layers.
+    parser.add_argument("--opt_batch", type=int, default=4, help="Batch size TensorRT tunes kernels for")
+    parser.add_argument(
+        "--max_batch", type=int, default=8, help="Largest batch the engine accepts (GPU memory grows with it)"
+    )
     parser.add_argument("--workspace_gb", type=float, default=4.0, help="Builder scratch memory limit")
     parser.add_argument("--timing_cache", default=None, help="Optional timing cache file to speed up rebuilds")
     parser.add_argument("--verbose", action="store_true")

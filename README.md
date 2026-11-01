@@ -50,6 +50,14 @@ python3 uvq_trt/export_onnx.py -o uvq_trt/uvq1p5.onnx
 The export is checked with ONNX Runtime against the unmodified PyTorch UVQ
 model and fails if the scores differ by more than 1e-3.
 
+| option | default | |
+|---|---|---|
+| `-o`, `--output FILE` | `uvq_trt/uvq1p5.onnx` | ONNX file to write |
+| `--uvq_dir DIR` | `uvq_trt/uvq` | google/uvq checkout (model code + checkpoints) |
+| `--opset N` | `17` | ONNX opset (>= 17 for a native LayerNormalization) |
+| `--skip_verify` | off | don't compare ONNX Runtime against PyTorch |
+| `--verify_batch N` | `2` | frames used for the verification run |
+
 ## 2. Build the TensorRT engine (on the GPU machine that will run it)
 
 Engines are specific to the GPU model and TensorRT version, so build on the
@@ -59,17 +67,39 @@ inference machine:
 python3 uvq_trt/build_engine.py uvq_trt/uvq1p5.onnx -o uvq_trt/uvq1p5_fp16.engine --fp16
 ```
 
-- `--fp16` - use FP16 kernels; the main speedup on Tensor Core GPUs. Omit for
-  an FP32 engine (the scores then match PyTorch to ~1e-5).
-- `--min_batch/--opt_batch/--max_batch` - engine batch range (default
-  1/24/24 frames, matching UVQ's CUDA batch size). Larger batches need more
-  GPU memory: each frame is run as 9 DistortionNet patches.
-- `--timing_cache FILE` - reuse kernel timings to make rebuilds faster.
+| option | default | |
+|---|---|---|
+| `onnx` | (required) | ONNX file written by `export_onnx.py` |
+| `-o`, `--output FILE` | next to the ONNX file | engine file to write |
+| `--fp16` | off | use FP16 kernels; the main speedup on Tensor Core GPUs. Omit for an FP32 engine (the scores then match PyTorch to ~1e-5) |
+| `--min_batch N` | `1` | smallest batch the engine accepts |
+| `--opt_batch N` | `4` | batch size TensorRT tunes kernels for |
+| `--max_batch N` | `8` | largest batch the engine accepts. GPU memory grows with it (see below) |
+| `--workspace_gb GB` | `4.0` | builder scratch memory limit |
+| `--timing_cache FILE` | none | reuse kernel timings to make rebuilds faster |
+| `--verbose` | off | verbose TensorRT builder log |
+
+**Choosing the batch size.** The engine is sized for `--max_batch`, and each
+1080p frame runs as 9 DistortionNet patches of 360x640, so GPU memory grows
+quickly with the batch: at batch 24 single layers request 7-9 GB, which fails
+on an 8 GB GPU with `Device memory is insufficient to use tactic` and
+`Error Code 2: OutOfMemory`. Roughly:
+
+| GPU memory | suggested `--opt_batch` / `--max_batch` |
+|---|---|
+| 6-8 GB (e.g. RTX 4060) | 4 / 4-8 (default 4 / 8) |
+| 12-16 GB | 8 / 16 |
+| 24 GB or more | 16 / 24 (UVQ's own CUDA batch size) |
+
+`--workspace_gb` only caps scratch memory, not these allocations, so lower
+the batch instead. Larger batches mostly cut per-call overhead; at batch 4
+the GPU already gets 36 patches per call, and FFmpeg decoding is usually
+the bottleneck. Building also takes much longer for large batches.
 
 Or with `trtexec`:
 
 ```bash
-trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp16.engine --fp16 --minShapes=frames:1x1080x1920x3 --optShapes=frames:24x1080x1920x3 --maxShapes=frames:24x1080x1920x3
+trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp16.engine --fp16 --minShapes=frames:1x1080x1920x3 --optShapes=frames:4x1080x1920x3 --maxShapes=frames:8x1080x1920x3
 ```
 
 ## 3. Run inference
@@ -88,17 +118,28 @@ python3 uvq_trt/uvq_trt_inference.py video.mp4 --engine uvq_trt/uvq1p5_fp16.engi
 python3 uvq_trt/uvq_trt_inference.py videos.txt --engine uvq_trt/uvq1p5_fp16.engine --output scores.txt
 ```
 
-- `--fps` - frames sampled per second (default `1`, `-1` = every frame).
-- `--hwaccel cuda` - decode with NVDEC. With TensorRT, FFmpeg decoding +
-  bicubic rescale to 1080p is usually the bottleneck, and the decoder is
-  bit-exact, so this speeds things up without changing the scores.
-- `--compare_pytorch` - also run the original PyTorch UVQ on the same device and
-  report `pytorch_uvq1p5_score` and `max_abs_frame_diff`; use it once to
-  check an FP16 engine's accuracy on your content.
-- `--transpose`, `--batch_size`, `--output`, `--ffmpeg_path`,
-  `--ffprobe_path` - as in UVQ.
+```
+uvq_trt_inference.py INPUT (--engine FILE | --onnx FILE) [options]
+```
 
-Decoding runs in a background thread, so it overlaps with GPU inference.
+| option | default | |
+|---|---|---|
+| `input` | (required) | a video file, or a `.txt` file with one video path per line |
+| `--engine FILE` | | TensorRT engine from step 2 (NVIDIA GPU). Exactly one of `--engine` / `--onnx` is required |
+| `--onnx FILE` | | ONNX file from step 1, run with ONNX Runtime on the CPU (see [below](#running-on-the-cpu-with-onnx-runtime)) |
+| `--uvq_dir DIR` | `uvq_trt/uvq` | google/uvq checkout (model code, checkpoints and its `utils/` for probing and decoding) |
+| `--output FILE` | none | single video: also write the full results as JSON. `.txt` input: required, one `name,score` line per video |
+| `--transpose` | off | transpose the video before scoring, for portrait videos. Single video only, as in UVQ; `.txt` input detects portrait videos automatically |
+| `--fps N` | `1` | frames sampled per second; `-1` = every frame |
+| `--batch_size N` | engine's max batch, `1` with `--onnx` | frames decoded and scored per batch |
+| `--threads N` | all cores | CPU threads for ONNX Runtime (`--onnx` only) |
+| `--hwaccel NAME` | none | FFmpeg `-hwaccel` for decoding, e.g. `cuda` for NVDEC. With TensorRT, FFmpeg decoding + bicubic rescale to 1080p is usually the bottleneck, and the decoder is bit-exact, so this speeds things up without changing the scores |
+| `--output_all_stats` | off | print the full JSON result (`uvq1p5_score`, `per_frame_scores`, `frame_indices`, `video_name`) instead of just the score |
+| `--compare_pytorch` | off | also run the original PyTorch UVQ on the same frames and device and report `pytorch_uvq1p5_score` and `max_abs_frame_diff`; use it once to check an FP16 engine's accuracy on your content |
+| `--ffmpeg_path PATH` | `ffmpeg` | FFmpeg executable |
+| `--ffprobe_path PATH` | `ffprobe` | ffprobe executable |
+
+Decoding runs in a background thread, so it overlaps with inference.
 
 ## Running on the CPU with ONNX Runtime
 
@@ -109,7 +150,8 @@ CUDA or TensorRT needed, and step 2 is skipped:
 python3 uvq_trt/uvq_trt_inference.py video.mp4 --onnx uvq_trt/uvq1p5.onnx --compare_pytorch --output_all_stats
 ```
 
-`--threads N` limits the CPU threads; all other options work as above.
+`--threads N` limits the CPU threads; all other options except `--hwaccel cuda`
+work as above.
 With `--compare_pytorch` the output includes `pytorch_uvq1p5_score` (the
 original UVQ model on the same frames) and `max_abs_frame_diff`, which
 should be around 1e-6.
