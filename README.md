@@ -64,14 +64,23 @@ Engines are specific to the GPU model and TensorRT version, so build on the
 inference machine:
 
 ```bash
-python3 uvq_trt/build_engine.py uvq_trt/uvq1p5.onnx -o uvq_trt/uvq1p5_fp16.engine --fp16
+python3 uvq_trt/build_engine.py uvq_trt/uvq1p5.onnx -o uvq_trt/uvq1p5_fp32.engine
 ```
+
+> **Don't use `--fp16` for now: FP16 engines return `NaN` scores.**
+> AggregationNet's `conv1` output exceeds the FP16 range (about 73,000
+> measured on real video vs. a 65,504 maximum), which becomes `inf` and then
+> `NaN` after its LayerNorm. Keeping just those layers in FP32 with per-layer
+> precision constraints doesn't help: TensorRT 10.16 ignores them (they are
+> deprecated since 10.12 in favor of strong typing). The FP32 engine matches
+> PyTorch to ~5e-4 per frame, and on an RTX 4060 inference is ~25 ms per
+> frame, so FFmpeg decoding and startup dominate the run time anyway.
 
 | option | default | |
 |---|---|---|
 | `onnx` | (required) | ONNX file written by `export_onnx.py` |
 | `-o`, `--output FILE` | next to the ONNX file | engine file to write |
-| `--fp16` | off | use FP16 kernels; the main speedup on Tensor Core GPUs. Omit for an FP32 engine (the scores then match PyTorch to ~1e-5) |
+| `--fp16` | off | use FP16 kernels. **Currently produces `NaN` scores (see above); leave it off** |
 | `--min_batch N` | `1` | smallest batch the engine accepts |
 | `--opt_batch N` | `4` | batch size TensorRT tunes kernels for |
 | `--max_batch N` | `8` | largest batch the engine accepts. GPU memory grows with it (see below) |
@@ -99,7 +108,7 @@ the bottleneck. Building also takes much longer for large batches.
 Or with `trtexec`:
 
 ```bash
-trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp16.engine --fp16 --minShapes=frames:1x1080x1920x3 --optShapes=frames:4x1080x1920x3 --maxShapes=frames:8x1080x1920x3
+trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp32.engine --minShapes=frames:1x1080x1920x3 --optShapes=frames:4x1080x1920x3 --maxShapes=frames:8x1080x1920x3
 ```
 
 ## 3. Run inference
@@ -107,15 +116,15 @@ trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp16.engine --fp1
 Same arguments and output as UVQ's `uvq_inference.py --model_version 1.5`:
 
 ```bash
-python3 uvq_trt/uvq_trt_inference.py video.mp4 --engine uvq_trt/uvq1p5_fp16.engine
+python3 uvq_trt/uvq_trt_inference.py video.mp4 --engine uvq_trt/uvq1p5_fp32.engine
 ```
 
 ```bash
-python3 uvq_trt/uvq_trt_inference.py video.mp4 --engine uvq_trt/uvq1p5_fp16.engine --output_all_stats
+python3 uvq_trt/uvq_trt_inference.py video.mp4 --engine uvq_trt/uvq1p5_fp32.engine --output_all_stats
 ```
 
 ```bash
-python3 uvq_trt/uvq_trt_inference.py videos.txt --engine uvq_trt/uvq1p5_fp16.engine --output scores.txt
+python3 uvq_trt/uvq_trt_inference.py videos.txt --engine uvq_trt/uvq1p5_fp32.engine --output scores.txt
 ```
 
 ```
@@ -135,7 +144,7 @@ uvq_trt_inference.py INPUT (--engine FILE | --onnx FILE) [options]
 | `--threads N` | all cores | CPU threads for ONNX Runtime (`--onnx` only) |
 | `--hwaccel NAME` | none | FFmpeg `-hwaccel` for decoding, e.g. `cuda` for NVDEC. With TensorRT, FFmpeg decoding + bicubic rescale to 1080p is usually the bottleneck, and the decoder is bit-exact, so this speeds things up without changing the scores |
 | `--output_all_stats` | off | print the full JSON result (`uvq1p5_score`, `per_frame_scores`, `frame_indices`, `video_name`) instead of just the score |
-| `--compare_pytorch` | off | also run the original PyTorch UVQ on the same frames and device and report `pytorch_uvq1p5_score` and `max_abs_frame_diff`; use it once to check an FP16 engine's accuracy on your content |
+| `--compare_pytorch` | off | also run the original PyTorch UVQ on the same frames and device and report `pytorch_uvq1p5_score` and `max_abs_frame_diff`; use it once to check an engine's accuracy on your content (expect ~5e-4 for FP32). Slows the run down, so leave it off when timing |
 | `--ffmpeg_path PATH` | `ffmpeg` | FFmpeg executable |
 | `--ffprobe_path PATH` | `ffprobe` | ffprobe executable |
 
