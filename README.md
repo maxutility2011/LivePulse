@@ -102,8 +102,8 @@ on an 8 GB GPU with `Device memory is insufficient to use tactic` and
 
 `--workspace_gb` only caps scratch memory, not these allocations, so lower
 the batch instead. Larger batches mostly cut per-call overhead; at batch 4
-the GPU already gets 36 patches per call, and FFmpeg decoding is usually
-the bottleneck. Building also takes much longer for large batches.
+the GPU already gets 36 patches per call, and FFmpeg decoding + rescaling
+often takes longer than inference anyway. Building also takes much longer for large batches.
 
 Or with `trtexec`:
 
@@ -142,7 +142,7 @@ uvq_trt_inference.py INPUT (--engine FILE | --onnx FILE) [options]
 | `--fps N` | `1` | frames sampled per second; `-1` = every frame |
 | `--batch_size N` | engine's max batch, `1` with `--onnx` | frames decoded and scored per batch |
 | `--threads N` | all cores | CPU threads for ONNX Runtime (`--onnx` only) |
-| `--hwaccel NAME` | none | FFmpeg `-hwaccel` for decoding, e.g. `cuda` for NVDEC. With TensorRT, FFmpeg decoding + bicubic rescale to 1080p is usually the bottleneck, and the decoder is bit-exact, so this speeds things up without changing the scores |
+| `--hwaccel NAME` | none | FFmpeg `-hwaccel` for decoding, e.g. `cuda` for NVDEC. The decoder is bit-exact, so scores don't change, but it is often **not** faster: UVQ's `fps`/bicubic `scale` filters run on the CPU, so every decoded frame (all of them, not only the sampled ones) is copied back from the GPU, and NVDEC adds a fixed start-up cost. E.g. 2560x1440 H.264 on a Ryzen 7 7700 + RTX 4060 decodes in 0.6 s on the CPU vs. 0.8 s with `cuda`. Mainly useful on weak or busy CPUs, or for heavy codecs (4K HEVC/AV1) |
 | `--output_all_stats` | off | print the full JSON result (`uvq1p5_score`, `per_frame_scores`, `frame_indices`, `video_name`) instead of just the score |
 | `--compare_pytorch` | off | also run the original PyTorch UVQ on the same frames and device and report `pytorch_uvq1p5_score` and `max_abs_frame_diff`; use it once to check an engine's accuracy on your content (expect ~5e-4 for FP32). Slows the run down, so leave it off when timing |
 | `--ffmpeg_path PATH` | `ffmpeg` | FFmpeg executable |
