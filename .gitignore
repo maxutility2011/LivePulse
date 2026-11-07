@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+
+# UVQ checkout (uvq_trt/fetch_uvq.sh) and generated models
+uvq_trt/uvq/
+*.onnx
+*.engine
+*.cache
+
+# Media and live-monitoring output
+*.mp4
+*.ts
+*.m4s
+uvq_live_segments/
+*.jsonl
