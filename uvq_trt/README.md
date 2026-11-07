@@ -2,7 +2,8 @@
 
 Scripts to serialize Google's [UVQ](https://github.com/google/uvq) 1.5
 no-reference video quality model into a TensorRT engine and run inference
-with it, e.g. to score the output of `roi_encoder.py`.
+with it, on video files or continuously on live streams
+([Live streams](#live-streams)).
 
 UVQ 1.5 is three PyTorch networks: ContentNet, DistortionNet (two
 EfficientNet-B0 backbones) and AggregationNet. Rather than three engines,
