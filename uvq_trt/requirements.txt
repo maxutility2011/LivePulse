@@ -1,0 +1,8 @@
+# Same torch/torchvision as google/uvq's requirements.txt (tested versions).
+torch==2.8.0
+torchvision==0.23.0
+numpy
+onnx>=1.16
+onnxruntime>=1.18
+# tensorrt>=8.6 is also needed for build_engine.py and --engine inference
+# (NVIDIA GPU machines only), plus a CUDA build of torch.
