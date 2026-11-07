@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 
 # UVQ checkout (uvq_trt/fetch_uvq.sh) and generated models
-uvq_trt/uvq/
+processor/uvq_trt/uvq/
 *.onnx
 *.engine
 *.cache
@@ -12,5 +12,5 @@ uvq_trt/uvq/
 *.mp4
 *.ts
 *.m4s
-uvq_live_segments/
+live/
 *.jsonl

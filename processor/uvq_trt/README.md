@@ -2,8 +2,9 @@
 
 Scripts to serialize Google's [UVQ](https://github.com/google/uvq) 1.5
 no-reference video quality model into a TensorRT engine and run inference
-with it, on video files or continuously on live streams
-([Live streams](#live-streams)).
+with it on video files. LivePulse's processor (`processor/lp_processor.py`)
+uses the same code to score live-stream segments; see the
+[LivePulse README](../../README.md).
 
 UVQ 1.5 is three PyTorch networks: ContentNet, DistortionNet (two
 EfficientNet-B0 backbones) and AggregationNet. Rather than three engines,
@@ -27,17 +28,17 @@ the conversion on your own videos before building an engine.
 
 ## Requirements
 
-- Python 3.10-3.13, `pip install -r uvq_trt/requirements.txt`
+- Python 3.10-3.13, `pip install -r processor/uvq_trt/requirements.txt`
 - `ffmpeg` / `ffprobe` on `PATH`
 - For the TensorRT path only: an NVIDIA GPU, CUDA, and TensorRT >= 8.6
   (TensorRT 10 recommended) with its Python bindings, e.g.
   `pip install tensorrt`
 
-Get the UVQ model code and checkpoints (cloned to `uvq_trt/uvq/`, pinned to a
+Get the UVQ model code and checkpoints (cloned to `processor/uvq_trt/uvq/`, pinned to a
 known revision):
 
 ```bash
-uvq_trt/fetch_uvq.sh
+processor/uvq_trt/fetch_uvq.sh
 ```
 
 On Windows, see [Windows, CPU only](#windows-cpu-only) below instead.
@@ -45,7 +46,7 @@ On Windows, see [Windows, CPU only](#windows-cpu-only) below instead.
 ## 1. Export ONNX (any machine, CPU is fine)
 
 ```bash
-python3 uvq_trt/export_onnx.py -o uvq_trt/uvq1p5.onnx
+python3 processor/uvq_trt/export_onnx.py -o processor/uvq_trt/uvq1p5.onnx
 ```
 
 The export is checked with ONNX Runtime against the unmodified PyTorch UVQ
@@ -53,8 +54,8 @@ model and fails if the scores differ by more than 1e-3.
 
 | option | default | |
 |---|---|---|
-| `-o`, `--output FILE` | `uvq_trt/uvq1p5.onnx` | ONNX file to write |
-| `--uvq_dir DIR` | `uvq_trt/uvq` | google/uvq checkout (model code + checkpoints) |
+| `-o`, `--output FILE` | `processor/uvq_trt/uvq1p5.onnx` | ONNX file to write |
+| `--uvq_dir DIR` | `processor/uvq_trt/uvq` | google/uvq checkout (model code + checkpoints) |
 | `--opset N` | `17` | ONNX opset (>= 17 for a native LayerNormalization) |
 | `--skip_verify` | off | don't compare ONNX Runtime against PyTorch |
 | `--verify_batch N` | `2` | frames used for the verification run |
@@ -65,7 +66,7 @@ Engines are specific to the GPU model and TensorRT version, so build on the
 inference machine:
 
 ```bash
-python3 uvq_trt/build_engine.py uvq_trt/uvq1p5.onnx -o uvq_trt/uvq1p5_fp32.engine
+python3 processor/uvq_trt/build_engine.py processor/uvq_trt/uvq1p5.onnx -o processor/uvq_trt/uvq1p5_fp32.engine
 ```
 
 > **Don't use `--fp16` for now: FP16 engines return `NaN` scores.**
@@ -109,7 +110,7 @@ often takes longer than inference anyway. Building also takes much longer for la
 Or with `trtexec`:
 
 ```bash
-trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp32.engine --minShapes=frames:1x1080x1920x3 --optShapes=frames:4x1080x1920x3 --maxShapes=frames:8x1080x1920x3
+trtexec --onnx=processor/uvq_trt/uvq1p5.onnx --saveEngine=processor/uvq_trt/uvq1p5_fp32.engine --minShapes=frames:1x1080x1920x3 --optShapes=frames:4x1080x1920x3 --maxShapes=frames:8x1080x1920x3
 ```
 
 ## 3. Run inference
@@ -117,15 +118,15 @@ trtexec --onnx=uvq_trt/uvq1p5.onnx --saveEngine=uvq_trt/uvq1p5_fp32.engine --min
 Same arguments and output as UVQ's `uvq_inference.py --model_version 1.5`:
 
 ```bash
-python3 uvq_trt/uvq_trt_inference.py video.mp4 --engine uvq_trt/uvq1p5_fp32.engine
+python3 processor/uvq_trt/uvq_trt_inference.py video.mp4 --engine processor/uvq_trt/uvq1p5_fp32.engine
 ```
 
 ```bash
-python3 uvq_trt/uvq_trt_inference.py video.mp4 --engine uvq_trt/uvq1p5_fp32.engine --output_all_stats
+python3 processor/uvq_trt/uvq_trt_inference.py video.mp4 --engine processor/uvq_trt/uvq1p5_fp32.engine --output_all_stats
 ```
 
 ```bash
-python3 uvq_trt/uvq_trt_inference.py videos.txt --engine uvq_trt/uvq1p5_fp32.engine --output scores.txt
+python3 processor/uvq_trt/uvq_trt_inference.py videos.txt --engine processor/uvq_trt/uvq1p5_fp32.engine --output scores.txt
 ```
 
 ```
@@ -137,7 +138,7 @@ uvq_trt_inference.py INPUT (--engine FILE | --onnx FILE) [options]
 | `input` | (required) | a video file, or a `.txt` file with one video path per line |
 | `--engine FILE` | | TensorRT engine from step 2 (NVIDIA GPU). Exactly one of `--engine` / `--onnx` is required |
 | `--onnx FILE` | | ONNX file from step 1, run with ONNX Runtime on the CPU (see [below](#running-on-the-cpu-with-onnx-runtime)) |
-| `--uvq_dir DIR` | `uvq_trt/uvq` | google/uvq checkout (model code, checkpoints and its `utils/` for probing and decoding) |
+| `--uvq_dir DIR` | `processor/uvq_trt/uvq` | google/uvq checkout (model code, checkpoints and its `utils/` for probing and decoding) |
 | `--output FILE` | none | single video: also write the full results as JSON. `.txt` input: required, one `name,score` line per video |
 | `--transpose` | off | transpose the video before scoring, for portrait videos. Single video only, as in UVQ; `.txt` input detects portrait videos automatically |
 | `--fps N` | `1` | frames sampled per second; `-1` = every frame |
@@ -151,102 +152,13 @@ uvq_trt_inference.py INPUT (--engine FILE | --onnx FILE) [options]
 
 Decoding runs in a background thread, so it overlaps with inference.
 
-## Live streams
-
-`uvq_live.py` scores a live stream continuously. FFmpeg records the input
-into fixed-length MP4 segments, and each finished segment is scored with the
-same pipeline as `uvq_trt_inference.py`, on the GPU (`--engine`) or the CPU
-(`--onnx`). The model stays loaded between segments, and recording never
-waits for scoring.
-
-```bash
-python3 uvq_trt/uvq_live.py "srt://host:9000" --engine uvq_trt/uvq1p5_fp32.engine --output live.jsonl
-python3 uvq_trt/uvq_live.py rtmp://host/live/key --onnx uvq_trt/uvq1p5.onnx --segment_seconds 30 --keep_duration 2h
-# simulate a live stream from a file
-python3 uvq_trt/uvq_live.py video.mp4 --input_args="-re -stream_loop -1" --engine uvq_trt/uvq1p5_fp32.engine
-```
-
-Each scored segment prints a line such as
-
-```
-[2026-11-06 17:12:39] seg_20261106-171232-645_00000.mp4    6.2s  UVQ 4.6234  [7 frames, scored in 1.0s, backlog 0]
-```
-
-and, with `--output`, appends a JSON line with `segment`, `finished_at`
-(wall-clock time the segment was closed), `duration`, `transpose`,
-`uvq1p5_score`, `per_frame_scores`, `frame_indices` and `scoring_seconds`.
-Segments are named `seg_<FFmpeg start time>_<counter>.mp4`; the counter
-restarts when FFmpeg reconnects. Stop with Ctrl+C (FFmpeg is asked to
-finish cleanly) or `--max_segments`.
-
-### Input formats
-
-All of these were tested end to end with FFmpeg 9 (a local FFmpeg sender
-feeding `uvq_live.py`), except live MPEG-DASH, see below:
-
-| format | example input | notes |
-|---|---|---|
-| SRT | `"srt://host:9000"` | caller mode by default; for a listener add `?mode=listener`. Options such as `latency` or `passphrase` go in the URL. Needs FFmpeg built with libsrt (the Gyan and BtbN Windows builds are) |
-| RTMP / RTMPS | `rtmp://host/app/key` | pulls from an RTMP server. To let an encoder push straight to this machine instead, listen: `rtmp://0.0.0.0:1935/live/key --input_args="-listen 1"` |
-| MPEG-TS over UDP / RTP, incl. multicast | `"udp://239.1.1.1:5000?overrun_nonfatal=1&fifo_size=50000000"` | add `localaddr=<this host's IP>` to pick the network interface that joins the group, `sources=` for SSM. The FIFO options keep bursts from being dropped. `rtp://...` works the same way |
-| HLS | `https://host/live/master.m3u8` | with a master playlist only the rendition chosen by `--map` is downloaded; a variant playlist URL works too. The first segments arrive faster than real time (shown as `backlog`) |
-| MPEG-DASH (live) | `https://host/live/manifest.mpd` | **partly supported** - see below |
-| RTSP, files, devices | `rtsp://cam/stream --input_args="-rtsp_transport tcp"` | anything else FFmpeg's `-i` opens (dshow/v4l2 devices usually need `--reencode`) |
-
-**Live MPEG-DASH.** FFmpeg's DASH demuxer reads the segments a live MPD
-lists, but at the live edge it requests the next one before it is
-published, fails 100 times without waiting and gives up ("Reached max
-consecutive fragment open failures"), with both `SegmentTimeline` and
-`$Number$` manifests. `uvq_live.py` then reconnects after
-`--reconnect_delay`, so you get a burst of segments every few seconds - scored
-samples of the stream, not continuous coverage. If the packager also offers
-HLS for the same stream (most do, often with the same CMAF segments), use the
-HLS URL instead.
-
-To pick one rendition of a multi-bitrate HLS/DASH stream, use `--map`, e.g.
-`--map 0:p:2:v:0` for the video of the third program. Run
-`ffprobe <url>` to list the programs.
-
-| option | default | |
-|---|---|---|
-| `input` | (required) | live URL or device, anything FFmpeg's `-i` accepts |
-| `--engine FILE` / `--onnx FILE` | | score on the GPU with TensorRT / on the CPU with ONNX Runtime (one is required) |
-| `--segment_seconds S` | `10` | segment length |
-| `--segment_dir DIR` | `uvq_live_segments` | where segments are written |
-| `--keep_duration T` | keep all | delete segments older than T, e.g. `90s`, `30m`, `2h`, `7d` (plain number = seconds); `0` deletes each one after scoring. Age is counted from when FFmpeg closed the segment; segments still waiting for scoring are never deleted, and leftovers of earlier runs in the same directory are cleaned up too |
-| `--map SPEC` | `0:v:0` | FFmpeg `-map` for the video to record, e.g. one rendition of an HLS/DASH stream |
-| `--reencode` | off | re-encode with libx264 instead of stream copy (see below) |
-| `--reencode_crf N` | `12` | x264 CRF for `--reencode` |
-| `--input_args "..."` | none | extra FFmpeg input options, e.g. `-rtsp_transport tcp`. Write it as `--input_args="-re"`: a separate value starting with `-` is taken for an option |
-| `--max_segments N` | `0` (forever) | stop after scoring N segments |
-| `--reconnect_delay S` | `5` | restart FFmpeg this long after the input drops; negative = exit instead |
-| `--max_backlog N` | `0` (never skip) | if more than N segments wait for scoring, skip the oldest so scores stay current |
-| `--transpose auto\|on\|off` | `auto` | `auto` transposes portrait video, like `.txt` input to `uvq_trt_inference.py` |
-| `--output FILE` | none | JSON-lines log, one line per scored segment |
-| `--fps`, `--batch_size`, `--threads`, `--hwaccel`, `--uvq_dir`, `--ffmpeg_path`, `--ffprobe_path` | | as for `uvq_trt_inference.py` |
-
-Notes:
-
-- **Stream copy vs. `--reencode`.** By default the video is stream-copied, so
-  what is scored is exactly what was received. Cuts can then only happen on
-  keyframes, so segments are about `--segment_seconds` rounded up to the
-  next keyframe (e.g. 6.2 s for 5 s with a 2.5 s GOP). `--reencode` gives
-  exact lengths and handles inputs MP4 can't hold (raw capture devices,
-  unusual codecs), at the cost of a little extra coding loss (CRF 12).
-- Only the first video stream is recorded; audio and subtitles are dropped.
-- Scoring must keep up with real time, or segments queue up (shown as
-  `backlog`, with a warning when one segment takes longer to score than it
-  lasts). With the default 1 frame per second this is easy: a 6 s 1440p
-  segment scores in about 1 s on an RTX 4060 and in about 2.5 s on a
-  Ryzen 7 7700 with ONNX Runtime.
-
 ## Running on the CPU with ONNX Runtime
 
 Pass the ONNX file from step 1 with `--onnx` instead of an engine; no GPU,
 CUDA or TensorRT needed, and step 2 is skipped:
 
 ```bash
-python3 uvq_trt/uvq_trt_inference.py video.mp4 --onnx uvq_trt/uvq1p5.onnx --compare_pytorch --output_all_stats
+python3 processor/uvq_trt/uvq_trt_inference.py video.mp4 --onnx processor/uvq_trt/uvq1p5.onnx --compare_pytorch --output_all_stats
 ```
 
 `--threads N` limits the CPU threads; all other options except `--hwaccel cuda`
@@ -271,13 +183,13 @@ Needs Python 3.10-3.13 (not 3.14: there are no Windows wheels of
 root of this repository:
 
 ```powershell
-git clone https://github.com/google/uvq.git uvq_trt\uvq
-git -C uvq_trt\uvq checkout c204ecc04f093e90c941cb126c7ac3d5beca0414
+git clone https://github.com/google/uvq.git processor\uvq_trt\uvq
+git -C processor\uvq_trt\uvq checkout c204ecc04f093e90c941cb126c7ac3d5beca0414
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r uvq_trt\requirements.txt
-python uvq_trt\export_onnx.py -o uvq_trt\uvq1p5.onnx
-python uvq_trt\uvq_trt_inference.py video.mp4 --onnx uvq_trt\uvq1p5.onnx --compare_pytorch --output_all_stats
+pip install -r processor\uvq_trt\requirements.txt
+python processor\uvq_trt\export_onnx.py -o processor\uvq_trt\uvq1p5.onnx
+python processor\uvq_trt\uvq_trt_inference.py video.mp4 --onnx processor\uvq_trt\uvq1p5.onnx --compare_pytorch --output_all_stats
 ```
 
 If `Activate.ps1` is blocked ("running scripts is disabled"), run
