@@ -83,7 +83,11 @@ def video_timing(path, fps, ffprobe_path):
 
     duration = probe.get_video_duration(path, ffprobe_path)
     orig_fps = probe.get_r_frame_rate(path, ffprobe_path)
-    nb_frames = probe.get_nb_frames(path, ffprobe_path)
+    # get_nb_frames runs ffprobe -count_frames, which decodes the whole video,
+    # so (like uvq_inference.py) only ask for it when it is actually needed.
+    nb_frames = None
+    if fps == -1 or not duration:
+        nb_frames = probe.get_nb_frames(path, ffprobe_path)
 
     video_length = 0
     if duration:

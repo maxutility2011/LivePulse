@@ -150,6 +150,95 @@ uvq_trt_inference.py INPUT (--engine FILE | --onnx FILE) [options]
 
 Decoding runs in a background thread, so it overlaps with inference.
 
+## Live streams
+
+`uvq_live.py` scores a live stream continuously. FFmpeg records the input
+into fixed-length MP4 segments, and each finished segment is scored with the
+same pipeline as `uvq_trt_inference.py`, on the GPU (`--engine`) or the CPU
+(`--onnx`). The model stays loaded between segments, and recording never
+waits for scoring.
+
+```bash
+python3 uvq_trt/uvq_live.py "srt://host:9000" --engine uvq_trt/uvq1p5_fp32.engine --output live.jsonl
+python3 uvq_trt/uvq_live.py rtmp://host/live/key --onnx uvq_trt/uvq1p5.onnx --segment_seconds 30 --keep_duration 2h
+# simulate a live stream from a file
+python3 uvq_trt/uvq_live.py video.mp4 --input_args="-re -stream_loop -1" --engine uvq_trt/uvq1p5_fp32.engine
+```
+
+Each scored segment prints a line such as
+
+```
+[2026-11-06 17:12:39] seg_20261106-171232-645_00000.mp4    6.2s  UVQ 4.6234  [7 frames, scored in 1.0s, backlog 0]
+```
+
+and, with `--output`, appends a JSON line with `segment`, `finished_at`
+(wall-clock time the segment was closed), `duration`, `transpose`,
+`uvq1p5_score`, `per_frame_scores`, `frame_indices` and `scoring_seconds`.
+Segments are named `seg_<FFmpeg start time>_<counter>.mp4`; the counter
+restarts when FFmpeg reconnects. Stop with Ctrl+C (FFmpeg is asked to
+finish cleanly) or `--max_segments`.
+
+### Input formats
+
+All of these were tested end to end with FFmpeg 9 (a local FFmpeg sender
+feeding `uvq_live.py`), except live MPEG-DASH, see below:
+
+| format | example input | notes |
+|---|---|---|
+| SRT | `"srt://host:9000"` | caller mode by default; for a listener add `?mode=listener`. Options such as `latency` or `passphrase` go in the URL. Needs FFmpeg built with libsrt (the Gyan and BtbN Windows builds are) |
+| RTMP / RTMPS | `rtmp://host/app/key` | pulls from an RTMP server. To let an encoder push straight to this machine instead, listen: `rtmp://0.0.0.0:1935/live/key --input_args="-listen 1"` |
+| MPEG-TS over UDP / RTP, incl. multicast | `"udp://239.1.1.1:5000?overrun_nonfatal=1&fifo_size=50000000"` | add `localaddr=<this host's IP>` to pick the network interface that joins the group, `sources=` for SSM. The FIFO options keep bursts from being dropped. `rtp://...` works the same way |
+| HLS | `https://host/live/master.m3u8` | with a master playlist only the rendition chosen by `--map` is downloaded; a variant playlist URL works too. The first segments arrive faster than real time (shown as `backlog`) |
+| MPEG-DASH (live) | `https://host/live/manifest.mpd` | **partly supported** - see below |
+| RTSP, files, devices | `rtsp://cam/stream --input_args="-rtsp_transport tcp"` | anything else FFmpeg's `-i` opens (dshow/v4l2 devices usually need `--reencode`) |
+
+**Live MPEG-DASH.** FFmpeg's DASH demuxer reads the segments a live MPD
+lists, but at the live edge it requests the next one before it is
+published, fails 100 times without waiting and gives up ("Reached max
+consecutive fragment open failures"), with both `SegmentTimeline` and
+`$Number$` manifests. `uvq_live.py` then reconnects after
+`--reconnect_delay`, so you get a burst of segments every few seconds - scored
+samples of the stream, not continuous coverage. If the packager also offers
+HLS for the same stream (most do, often with the same CMAF segments), use the
+HLS URL instead.
+
+To pick one rendition of a multi-bitrate HLS/DASH stream, use `--map`, e.g.
+`--map 0:p:2:v:0` for the video of the third program. Run
+`ffprobe <url>` to list the programs.
+
+| option | default | |
+|---|---|---|
+| `input` | (required) | live URL or device, anything FFmpeg's `-i` accepts |
+| `--engine FILE` / `--onnx FILE` | | score on the GPU with TensorRT / on the CPU with ONNX Runtime (one is required) |
+| `--segment_seconds S` | `10` | segment length |
+| `--segment_dir DIR` | `uvq_live_segments` | where segments are written |
+| `--keep_duration T` | keep all | delete segments older than T, e.g. `90s`, `30m`, `2h`, `7d` (plain number = seconds); `0` deletes each one after scoring. Age is counted from when FFmpeg closed the segment; segments still waiting for scoring are never deleted, and leftovers of earlier runs in the same directory are cleaned up too |
+| `--map SPEC` | `0:v:0` | FFmpeg `-map` for the video to record, e.g. one rendition of an HLS/DASH stream |
+| `--reencode` | off | re-encode with libx264 instead of stream copy (see below) |
+| `--reencode_crf N` | `12` | x264 CRF for `--reencode` |
+| `--input_args "..."` | none | extra FFmpeg input options, e.g. `-rtsp_transport tcp`. Write it as `--input_args="-re"`: a separate value starting with `-` is taken for an option |
+| `--max_segments N` | `0` (forever) | stop after scoring N segments |
+| `--reconnect_delay S` | `5` | restart FFmpeg this long after the input drops; negative = exit instead |
+| `--max_backlog N` | `0` (never skip) | if more than N segments wait for scoring, skip the oldest so scores stay current |
+| `--transpose auto\|on\|off` | `auto` | `auto` transposes portrait video, like `.txt` input to `uvq_trt_inference.py` |
+| `--output FILE` | none | JSON-lines log, one line per scored segment |
+| `--fps`, `--batch_size`, `--threads`, `--hwaccel`, `--uvq_dir`, `--ffmpeg_path`, `--ffprobe_path` | | as for `uvq_trt_inference.py` |
+
+Notes:
+
+- **Stream copy vs. `--reencode`.** By default the video is stream-copied, so
+  what is scored is exactly what was received. Cuts can then only happen on
+  keyframes, so segments are about `--segment_seconds` rounded up to the
+  next keyframe (e.g. 6.2 s for 5 s with a 2.5 s GOP). `--reencode` gives
+  exact lengths and handles inputs MP4 can't hold (raw capture devices,
+  unusual codecs), at the cost of a little extra coding loss (CRF 12).
+- Only the first video stream is recorded; audio and subtitles are dropped.
+- Scoring must keep up with real time, or segments queue up (shown as
+  `backlog`, with a warning when one segment takes longer to score than it
+  lasts). With the default 1 frame per second this is easy: a 6 s 1440p
+  segment scores in about 1 s on an RTX 4060 and in about 2.5 s on a
+  Ryzen 7 7700 with ONNX Runtime.
+
 ## Running on the CPU with ONNX Runtime
 
 Pass the ONNX file from step 1 with `--onnx` instead of an engine; no GPU,
