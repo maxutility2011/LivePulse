@@ -1,236 +1,216 @@
-"""LivePulse ingestor: records a live stream into fragmented-MP4 segments.
+"""LivePulse ingestor: turns one live stream into an HLS stream with fMP4 segments.
 
-FFmpeg reads the input (anything it can open: SRT, RTMP, UDP/RTP MPEG-TS
-incl. multicast, HLS, RTSP, a capture device, ...; live MPEG-DASH only
-partly, see README.md) and cuts it into fixed-length fragmented MP4 (fMP4)
-segments. Every finished segment is announced with one JSON line appended to
-<out_dir>/segments.jsonl, which the processor (processor/lp_processor.py)
-follows:
+Inputs (one stream per ingestor):
+  RTMP push, SRT push, MPEG-TS over UDP/RTP (incl. multicast)
+      the ingestor listens on --port
+  SRT pull, HLS, DASH
+      the ingestor pulls from --port on the remote host
 
-    {"stream": "cam1", "segment": "seg_20261107-120000-123_00004.mp4",
-     "duration": 10.0, "finished_at": "2026-11-07T12:00:52"}
+Continuous inputs (RTMP, SRT, MPEG-TS) are stream-copied - never re-encoded -
+and cut on GOP boundaries: each segment holds the fewest whole GOPs that
+reach --segment_seconds (5 s with a 2 s GOP -> 3 GOPs = 6 s). HLS inputs
+are passed through segment by segment (TS, CMAF or fMP4), and DASH inputs
+are passed through and republished as HLS.
 
-A line is only written once FFmpeg has closed the segment, so every listed
-file is complete.
+The output - a media playlist, init segment(s) and media segments - goes to
+the cloud bucket given by --cloud_upload_url (gs://... or s3://...), or else
+to <--nginx_webroot>/<--stream_id>/ to be served by Nginx.
 
 Examples:
-    python ingestor/lp_ingestor.py "srt://host:9000" --stream_id cam1 --out_dir live/cam1
-    python ingestor/lp_ingestor.py rtmp://host/live/key --out_dir live/key --keep_duration 2h
-    python ingestor/lp_ingestor.py "udp://239.1.1.1:5000?overrun_nonfatal=1&fifo_size=50000000" --out_dir live/mc1
-    # Simulate a live stream from a file:
-    python ingestor/lp_ingestor.py video.mp4 --input_args="-re -stream_loop -1" --out_dir live/test
+  # RTMP push to rtmp://<host>:1935/live/cam1, served by Nginx
+  python ingestor/lp_ingestor.py --input_url rtmp://0.0.0.0/live/cam1 --port 1935 --stream_id cam1
+  # SRT push (listener) -> GCS
+  python ingestor/lp_ingestor.py --input_url srt://0.0.0.0 --port 9000 --cloud_upload_url gs://my-bucket/live
+  # SRT pull (caller) from an encoder
+  python ingestor/lp_ingestor.py --input_url "srt://encoder.example.com?latency=200000" --port 9000 --input_mode pull
+  # Multicast MPEG-TS
+  python ingestor/lp_ingestor.py --input_url "udp://239.1.1.1?localaddr=10.0.0.5" --port 5000
+  # HLS or DASH pull -> S3
+  python ingestor/lp_ingestor.py --input_url https://cdn.example.com/live/index.m3u8 --port 443 --cloud_upload_url s3://bucket/live
 """
 
 import argparse
-import csv
-import datetime
-import json
+import logging
 import os
-import shlex
-import subprocess
+import signal
 import sys
 import threading
 import time
+import urllib.parse
 
-MANIFEST_NAME = "segments.jsonl"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from continuous import ContinuousIngest  # noqa: E402
+from hls_output import HlsOutput, make_publisher  # noqa: E402
+from pull import DashPull, HlsPull, http_get  # noqa: E402
 
+log = logging.getLogger("ingestor")
 
-def parse_duration(text):
-    """'90' / '90s' / '30m' / '2h' / '7d' -> seconds."""
-    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    text = text.strip().lower()
-    try:
-        seconds = float(text[:-1]) * units[text[-1]] if text and text[-1] in units else float(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"invalid duration {text!r} (use e.g. 90s, 30m, 2h, 7d)")
-    if seconds < 0:
-        raise argparse.ArgumentTypeError("duration must not be negative")
-    return seconds
+DEFAULT_MODE = {"rtmp": "listen", "rtmps": "listen", "srt": "listen", "udp": "listen", "rtp": "listen",
+                "http": "pull", "https": "pull"}
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="\n\n".join(__doc__.split("\n\n")[1:]),
     )
-    parser.add_argument("input", help="Live input URL or device, anything FFmpeg's -i accepts")
-    parser.add_argument("--out_dir", default="live", help="Where segments and segments.jsonl go (default live)")
-    parser.add_argument("--stream_id", default=None, help="Name of this stream in all records (default: out_dir name)")
-    parser.add_argument("--segment_seconds", type=float, default=10.0, help="Segment length (default 10)")
-    parser.add_argument(
-        "--keep_duration", type=parse_duration, default=None,
-        help="Delete segments older than this, e.g. 90s, 30m, 2h, 7d (plain number = seconds) "
-             "(default: keep all). Must exceed how far the processor may fall behind",
-    )
-    parser.add_argument(
-        "--map", default="0:v:0",
-        help="FFmpeg -map for the video to record (default 0:v:0). For HLS/DASH with several renditions "
-             "pick one, e.g. 0:p:2:v:0, or pass the variant playlist URL",
-    )
-    parser.add_argument(
-        "--reencode", action="store_true",
-        help="Re-encode (libx264, CRF --reencode_crf) instead of stream copy: exact segment lengths and "
-             "works for inputs MP4 can't hold, but adds (small) coding loss",
-    )
-    parser.add_argument("--reencode_crf", type=int, default=12, help="x264 CRF for --reencode (default 12)")
-    parser.add_argument("--input_args", default="", help='Extra FFmpeg input options, e.g. --input_args="-re"')
-    parser.add_argument(
-        "--reconnect_delay", type=float, default=5.0,
-        help="Seconds before restarting FFmpeg when the input drops; negative = exit instead (default 5)",
-    )
-    parser.add_argument("--max_segments", type=int, default=0, help="Stop after N segments (0 = run forever)")
-    parser.add_argument("--ffmpeg_path", default="ffmpeg")
-    args = parser.parse_args()
+    src = parser.add_argument_group("input")
+    src.add_argument("--input_url", required=True,
+                     help="rtmp://, srt://, udp://, rtp:// (host = bind/multicast address when listening, "
+                          "remote host when pulling) or http(s):// HLS/DASH URL")
+    src.add_argument("--port", type=int, required=True,
+                     help="Local port to listen on (RTMP/SRT push, UDP/RTP) or remote port to pull from "
+                          "(SRT pull, HLS/DASH)")
+    src.add_argument("--input_mode", choices=["listen", "pull"], default=None,
+                     help="listen (push inputs) or pull; default: listen for rtmp/srt/udp/rtp, pull for http(s)")
+    src.add_argument("--input_format", choices=["auto", "hls", "dash"], default="auto",
+                     help="For http(s) inputs; auto = by .m3u8/.mpd extension or content")
+    src.add_argument("--input_args", default="", help='Extra FFmpeg input options, e.g. --input_args="-re"')
+    src.add_argument("--stall_timeout", type=float, default=15.0,
+                     help="Seconds without data before an SRT/UDP/RTP input is reopened (0 = never; default 15)")
+    src.add_argument("--reconnect_delay", type=float, default=3.0,
+                     help="Seconds before reopening a dropped continuous input; negative = exit instead (default 3)")
+
+    seg = parser.add_argument_group("segmenting")
+    seg.add_argument("--segment_seconds", type=float, default=6.0,
+                     help="Minimum segment length; continuous inputs are cut after the fewest whole GOPs reaching it "
+                          "(default 6)")
+    seg.add_argument("--audio", choices=["copy", "aac", "none"], default="copy",
+                     help="Continuous inputs: copy the first audio stream (AAC expected), re-encode it to AAC, "
+                          "or drop it (default copy). Video is never re-encoded")
+    seg.add_argument("--audio_bitrate", default="128k", help="Bitrate for --audio aac (default 128k)")
+
+    out = parser.add_argument_group("output")
+    out.add_argument("--stream_id", default="live", help="Output folder / object prefix for this stream (default live)")
+    out.add_argument("--cloud_upload_url", default="",
+                     help="gs://bucket[/prefix] or s3://bucket[/prefix]; if not given, write to --nginx_webroot")
+    out.add_argument("--nginx_webroot", default="/var/www/html", help="Nginx webroot (default /var/www/html)")
+    out.add_argument("--playlist_name", default="index.m3u8", help="Media playlist name (default index.m3u8)")
+    out.add_argument("--hls_list_size", type=int, default=10,
+                     help="Segments in the live playlist; older ones are deleted (0 = keep all, EVENT playlist)")
+    out.add_argument("--staging_dir", default=os.path.join(os.sep, "tmp", "lp_storage"),
+                     help="Scratch space for FFmpeg's per-GOP fragments (default /tmp/lp_storage)")
+
+    misc = parser.add_argument_group("misc")
+    misc.add_argument("--max_segments", type=int, default=0, help="Stop after publishing N segments (0 = run forever)")
+    misc.add_argument("--no_endlist", action="store_true", help="Don't mark the playlist as ended when stopping")
+    misc.add_argument("--ffmpeg_path", default="ffmpeg")
+    misc.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    args = parser.parse_args(argv)
     if args.segment_seconds <= 0:
         parser.error("--segment_seconds must be positive")
-    if args.stream_id is None:
-        args.stream_id = os.path.basename(os.path.normpath(os.path.abspath(args.out_dir)))
+    if not 0 < args.port < 65536:
+        parser.error("--port must be 1-65535")
     return args
 
 
-def log(message):
-    print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+def with_port(url, port):
+    """Puts --port into a pull URL, or checks that the URL's own port agrees."""
+    if url.port is not None and url.port != port:
+        raise SystemExit(f"--port {port} disagrees with the port in --input_url ({url.port})")
+    host = url.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"  # IPv6
+    userinfo = url.netloc.rsplit("@", 1)[0] + "@" if "@" in url.netloc else ""
+    return url._replace(netloc=f"{userinfo}{host}:{port}")
 
 
-class Ingestor:
-    """Runs FFmpeg's segment muxer and announces each closed segment.
-
-    FFmpeg appends a row to its CSV segment list only after a segment is
-    finalized; that list is followed here and turned into manifest lines.
-    """
-
-    def __init__(self, args):
-        self.args = args
-        self.manifest = os.path.join(args.out_dir, MANIFEST_NAME)
-        self.process = None
-        self.stopping = threading.Event()
-        self.count = 0
-        self.started_at = time.time()
-        self.done = set()  # finished segments of this run
-
-    def command(self, list_path, name_pattern):
-        a = self.args
-        cmd = [a.ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostats"]
-        cmd += shlex.split(a.input_args, posix=os.name != "nt")
-        cmd += ["-i", a.input, "-map", a.map, "-an", "-sn", "-dn"]
-        if a.reencode:
-            # Keyframes exactly on segment boundaries -> exact segment lengths.
-            cmd += [
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(a.reencode_crf), "-pix_fmt", "yuv420p",
-                "-force_key_frames", f"expr:gte(t,n_forced*{a.segment_seconds})",
-            ]
-        else:
-            # Stream copy: exactly what was received, but cuts happen at keyframes.
-            cmd += ["-c:v", "copy"]
-        cmd += [
-            "-f", "segment", "-segment_time", str(a.segment_seconds), "-reset_timestamps", "1",
-            "-segment_format", "mp4",
-            # Fragmented MP4: moov up front, then moof/mdat per keyframe.
-            "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof",
-            "-segment_list", list_path, "-segment_list_type", "csv",
-            os.path.join(a.out_dir, name_pattern),
-        ]
-        return cmd
-
-    def run(self):
-        while not self.stopping.is_set():
-            run_start = time.time()
-            # Names are <FFmpeg start time>_<counter>: inputs like HLS deliver
-            # their first segments faster than real time, so per-segment
-            # timestamps would collide.
-            now = datetime.datetime.now()
-            stamp = f"{now:%Y%m%d-%H%M%S}-{now.microsecond // 1000:03d}"
-            list_path = os.path.join(self.args.out_dir, f".ffmpeg_list_{stamp}.csv")
-            open(list_path, "w").close()
-            log(f"Recording {self.args.input} as stream '{self.args.stream_id}' into "
-                f"{self.args.segment_seconds:g}s fMP4 segments in {self.args.out_dir}")
-            self.process = subprocess.Popen(self.command(list_path, f"seg_{stamp}_%05d.mp4"), stdin=subprocess.PIPE)
-            self.follow_list(list_path)
-            code = self.process.wait()
-            os.remove(list_path)
-            if self.stopping.is_set():
-                break
-            log(f"FFmpeg exited with code {code} after {time.time() - run_start:.0f}s")
-            if self.args.reconnect_delay < 0:
-                break
-            log(f"Reconnecting in {self.args.reconnect_delay:g}s")
-            if self.stopping.wait(self.args.reconnect_delay):
-                break
-
-    def follow_list(self, list_path):
-        """Tails FFmpeg's segment list until FFmpeg exits."""
-        seen = 0
-        while True:
-            exited = self.process.poll() is not None
-            with open(list_path, newline="") as f:
-                rows = [r for r in csv.reader(f) if len(r) >= 3]
-            for name, start, end in (r[:3] for r in rows[seen:]):
-                self.announce(os.path.basename(name), float(end) - float(start))
-            seen = len(rows)
-            if exited:
-                return
-            time.sleep(0.2)
-
-    def announce(self, name, duration):
-        record = {
-            "stream": self.args.stream_id,
-            "segment": name,
-            "duration": round(duration, 3),
-            "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        }
-        with open(self.manifest, "a") as f:
-            f.write(json.dumps(record) + "\n")
-        self.count += 1
-        self.done.add(os.path.join(self.args.out_dir, name))
-        log(f"{name}  {duration:5.1f}s")
-        self.apply_retention()
-        if self.args.max_segments and self.count >= self.args.max_segments:
-            threading.Thread(target=self.stop, daemon=True).start()
-
-    def apply_retention(self):
-        """Deletes finished segments (and leftovers of earlier runs) older than --keep_duration."""
-        if self.args.keep_duration is None:
-            return
-        cutoff = time.time() - self.args.keep_duration
-        for entry in os.scandir(self.args.out_dir):
-            if not (entry.name.startswith("seg_") and entry.name.endswith(".mp4")):
-                continue
-            try:
-                mtime = entry.stat().st_mtime  # last write = when FFmpeg closed it
-                if (entry.path in self.done or mtime < self.started_at) and mtime <= cutoff:
-                    os.remove(entry.path)
-                    self.done.discard(entry.path)
-            except OSError as e:
-                log(f"Could not delete {entry.name}: {e}")
-
-    def stop(self):
-        """Asks FFmpeg to finish cleanly ('q') so the open segment is completed."""
-        self.stopping.set()
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.stdin.write(b"q")
-                self.process.stdin.flush()
-                self.process.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                self.process.terminate()
+def add_query(query, **defaults):
+    params = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    present = {k for k, _ in params}
+    params += [(k, str(v)) for k, v in defaults.items() if v is not None and k not in present]
+    return urllib.parse.urlencode(params, safe=":/")
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
-    ingestor = Ingestor(args)
-    # Recording runs in a worker thread so that on Ctrl+C the main thread can
-    # stop FFmpeg while the worker still announces the segment it closes.
-    worker = threading.Thread(target=ingestor.run, daemon=True)
+def plan_input(args):
+    """Returns ("continuous", ffmpeg_input_args, description) or ("hls"/"dash", url, description)."""
+    url = urllib.parse.urlparse(args.input_url)
+    scheme = url.scheme.lower()
+    if scheme not in DEFAULT_MODE:
+        raise SystemExit(f"Unsupported input scheme '{scheme}://' (use rtmp, srt, udp, rtp, http or https)")
+    mode = args.input_mode or DEFAULT_MODE[scheme]
+    port = args.port
+    stall_us = int(args.stall_timeout * 1e6) if args.stall_timeout > 0 else None
+
+    if scheme in ("http", "https"):
+        if mode != "pull":
+            raise SystemExit("HLS/DASH inputs can only be pulled")
+        full = urllib.parse.urlunparse(with_port(url, port))
+        fmt = args.input_format
+        if fmt == "auto":
+            path = url.path.lower()
+            if path.endswith(".mpd"):
+                fmt = "dash"
+            elif path.endswith(".m3u8"):
+                fmt = "hls"
+            else:
+                body = http_get(full)[0][:2048]
+                fmt = "dash" if b"<MPD" in body else "hls"
+        return fmt, full, f"{fmt.upper()} pull from {full}"
+
+    if scheme in ("rtmp", "rtmps"):
+        path = url.path if url.path not in ("", "/") else "/live/stream"
+        if mode == "listen":
+            u = f"{scheme}://0.0.0.0:{port}{path}"
+            return "continuous", ["-listen", "1", "-i", u], f"RTMP push on port {port} ({path})"
+        u = urllib.parse.urlunparse(with_port(url, port))
+        return "continuous", ["-i", u], f"RTMP pull from {u}"
+
+    if scheme == "srt":
+        if mode == "listen":
+            q = add_query(url.query, mode="listener", timeout=stall_us)
+            u = f"srt://{url.hostname or '0.0.0.0'}:{port}?{q}"
+            return "continuous", ["-i", u], f"SRT push (listener) on port {port}"
+        q = add_query(url.query, mode="caller", timeout=stall_us)
+        u = urllib.parse.urlunparse(with_port(url, port)._replace(query=q))
+        return "continuous", ["-i", u], f"SRT pull (caller) from {url.hostname}:{port}"
+
+    # udp / rtp: MPEG-TS, unicast or multicast; always received (listen)
+    if mode != "listen":
+        raise SystemExit("UDP/RTP inputs are received on a local port; use --input_mode listen")
+    host = url.hostname or "0.0.0.0"
+    extra = {"overrun_nonfatal": 1, "fifo_size": 50000000} if scheme == "udp" else {}
+    q = add_query(url.query, timeout=stall_us, **extra)
+    u = f"{scheme}://{host}:{port}?{q}"
+    kind = "multicast" if host.split(".")[0].isdigit() and 224 <= int(host.split(".")[0]) <= 239 else "unicast"
+    return "continuous", ["-i", u], f"MPEG-TS over {scheme.upper()} ({kind} {host}:{port})"
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stdout)
+    kind, spec, description = plan_input(args)
+    publisher = make_publisher(args.cloud_upload_url, args.nginx_webroot, args.stream_id)
+    output = HlsOutput(publisher, args.playlist_name, args.hls_list_size)
+    log.info("Input:  %s", description)
+    log.info("Output: %s/%s (%gs segments, %s)", publisher.description.rstrip("/"), args.playlist_name,
+             args.segment_seconds, f"window {args.hls_list_size}" if args.hls_list_size else "keep all")
+
+    if kind == "continuous":
+        ingest = ContinuousIngest(args, spec, output)
+    elif kind == "hls":
+        ingest = HlsPull(args, spec, output)
+    else:
+        ingest = DashPull(args, spec, output)
+
+    # docker stop sends SIGTERM: treat it like Ctrl+C.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("ended", ingest.run()), name="ingest", daemon=True)
     worker.start()
     try:
         while worker.is_alive():
             worker.join(0.5)
+            if args.max_segments and output.published >= args.max_segments:
+                log.info("Published %d segments (--max_segments)", output.published)
+                break
     except KeyboardInterrupt:
-        log("Stopping (Ctrl+C)...")
-        ingestor.stop()
-        worker.join(15)
-    log(f"Recorded {ingestor.count} segments")
+        log.info("Stopping...")
+    ingest.stop()
+    worker.join(20)
+    output.finish(endlist=not args.no_endlist)
+    log.info("Done: %d segments published", output.published)
     return 0
 
 

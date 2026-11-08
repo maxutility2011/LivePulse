@@ -1,0 +1,3 @@
+# Cloud upload (--cloud_upload_url gs://... / s3://...). Imported only when used.
+google-cloud-storage>=2.14,<4
+boto3>=1.34,<2

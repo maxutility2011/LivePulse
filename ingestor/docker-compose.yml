@@ -1,0 +1,50 @@
+# Example LivePulse ingestor deployments - one container per live stream.
+#   docker compose -f ingestor/docker-compose.yml up -d --build
+# Each service publishes its ingest port and Nginx (HLS output) on its own host port.
+services:
+  # SRT push (listener): encoders send to srt://<host>:9000
+  ingest-cam1:
+    build: .
+    image: livepulse-ingestor
+    command: >-
+      --input_url "srt://0.0.0.0?latency=500000"
+      --port 9000 --stream_id cam1 --segment_seconds 6
+    ports:
+      - "9000:9000/udp"   # SRT is UDP
+      - "8081:80"         # http://<host>:8081/cam1/index.m3u8
+    tmpfs:
+      - /tmp/lp_storage   # per-GOP scratch space
+    restart: unless-stopped
+
+  # RTMP push: encoders publish to rtmp://<host>:1935/live/cam2
+  ingest-cam2:
+    image: livepulse-ingestor
+    command: --input_url rtmp://0.0.0.0/live/cam2 --port 1935 --stream_id cam2
+    ports:
+      - "1935:1935"
+      - "8082:80"
+    tmpfs:
+      - /tmp/lp_storage
+    restart: unless-stopped
+
+  # HLS pull -> GCS (credentials: a mounted service-account key)
+  # ingest-cdn1:
+  #   image: livepulse-ingestor
+  #   command: >-
+  #     --input_url https://cdn.example.com/live/master.m3u8 --port 443
+  #     --stream_id cdn1 --cloud_upload_url gs://my-bucket/live
+  #   environment:
+  #     GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcs.json
+  #     LP_DISABLE_NGINX: "1"
+  #   volumes:
+  #     - ./gcs.json:/secrets/gcs.json:ro
+  #   restart: unless-stopped
+
+  # Multicast MPEG-TS needs the host's network stack (Linux hosts):
+  # ingest-mc1:
+  #   image: livepulse-ingestor
+  #   network_mode: host
+  #   command: >-
+  #     --input_url "udp://239.1.1.1?localaddr=10.0.0.5" --port 5000
+  #     --stream_id mc1 --nginx_webroot /var/www/html
+  #   restart: unless-stopped
