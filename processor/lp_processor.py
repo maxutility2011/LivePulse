@@ -67,7 +67,11 @@ def parse_args(argv=None):
                                                                    else os.path.join(HERE, "uvq_trt", "engines")),
                      help="Where GPU-specific TensorRT engines are built and cached")
     dev.add_argument("--threads", type=int, default=None, help="CPU threads for ONNX Runtime (default: all cores)")
-    dev.add_argument("--batch_size", type=int, default=None, help="Frames per inference batch (default 8 GPU / 1 CPU)")
+    dev.add_argument("--batch_size", type=int, default=None,
+                     help="Frames per inference batch (default: --max_batch on GPU, 1 on CPU)")
+    dev.add_argument("--max_batch", type=int, default=8,
+                     help="Largest batch the TensorRT engine is built for (default 8, ~3 GB GPU memory); "
+                          "lower it for small GPUs")
     dev.add_argument("--transpose", choices=["auto", "on", "off"], default="auto",
                      help="Transpose frames before scoring; auto = for portrait video")
     flow = parser.add_argument_group("stream handling")
@@ -211,7 +215,7 @@ def main(argv=None):
     if args.http_port:
         serve(store, args.http_host, args.http_port)
     scorer = Scorer(args.device, args.onnx, args.engine, args.engine_cache_dir, args.fps, args.threads,
-                    args.batch_size, args.transpose, args.ffmpeg_path)
+                    args.batch_size, args.transpose, args.ffmpeg_path, args.max_batch)
     store.update_status(phase=None)
     if args.output:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)

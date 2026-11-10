@@ -38,6 +38,27 @@ visible and TensorRT installed - and otherwise falls back to the CPU:
   up during the build and says so.
 - FP16 engines are not used: UVQ's AggregationNet overflows FP16 and returns
   NaN (see [uvq_trt/README.md](uvq_trt/README.md)).
+- **Fallback.** At startup one test frame runs through the model. If
+  anything about the GPU fails - building or loading the engine (e.g. a GPU
+  generation TensorRT doesn't support, or too little GPU memory) or the test
+  frame - `--device auto` logs the cause and falls back to the CPU; with
+  `--device gpu` the processor exits with the error instead.
+- **Small GPUs.** The engine is built for batches of up to `--max_batch`
+  frames (default 8, which needed about 3 GB of GPU memory to build on an
+  RTX 4060). On GPUs with less memory use `--max_batch 4`, `2` or `1`;
+  scoring stays the same (batch 2 matched batch 8 within 4e-4), only
+  slightly slower. Cached engines are named by batch size, GPU model and
+  TensorRT version, e.g. `uvq1p5_fp32_b8_nvidia-geforce-rtx-4060_trt10.16.1.11.engine`,
+  so servers with different GPUs can share one cache volume.
+
+**Running on other servers.** The same image runs on any x86-64 host. For
+the GPU path it needs an NVIDIA GPU of the Turing generation or newer (RTX
+20-50 series, T4, A10, A100, L4, H100, ...), a host driver for CUDA 12.8
+(570 or later), and GPU access for containers: the NVIDIA Container Toolkit
+on Linux, or Docker Desktop with WSL 2 on Windows (where the Linux container
+uses the Windows driver through WSL 2's GPU support). Anything else - no
+GPU, a non-NVIDIA GPU, a missing `--gpus all` - scores on the CPU. ARM hosts
+need the image rebuilt for ARM.
 
 **What `--fps` means.** UVQ samples `--fps` frames **per second of video**
 (with FFmpeg's `fps` filter), so `--fps 5` is every 5th frame of a 25 fps
@@ -120,9 +141,10 @@ The browser keeps up to an hour of frames; the processor keeps
 |---|---|---|
 | `--input_url URL` | (required) | HLS variant playlist (a master playlist works too) |
 | `--stream_id NAME` | from the URL (`.../cam1/index.m3u8` -> `cam1`) | name in the UI and output |
-| `--device auto\|gpu\|cpu` | `auto` | GPU when usable, else CPU; `gpu` fails if none is usable |
+| `--device auto\|gpu\|cpu` | `auto` | GPU when usable (falls back to the CPU if the GPU fails at startup), else CPU; `gpu` exits if the GPU can't be used |
 | `--fps N` | 5 GPU / 1 CPU | frames sampled per second of video |
-| `--batch_size N` | 8 GPU / 1 CPU | frames per inference call (GPU: up to the engine's max batch, 8) |
+| `--max_batch N` | `8` | largest batch the TensorRT engine is built for; lower it for GPUs with little memory |
+| `--batch_size N` | `--max_batch` GPU / 1 CPU | frames per inference call |
 | `--threads N` | all cores | ONNX Runtime CPU threads |
 | `--transpose auto\|on\|off` | `auto` | transpose portrait video before scoring |
 | `--onnx FILE` | `/opt/livepulse/models/uvq1p5.onnx` in the image | UVQ 1.5 ONNX model |

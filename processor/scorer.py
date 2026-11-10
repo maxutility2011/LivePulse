@@ -45,18 +45,18 @@ def gpu_status():
     return True, torch.cuda.get_device_name(0)
 
 
-def engine_path_for(cache_dir):
+def engine_path_for(cache_dir, max_batch):
     import tensorrt as trt
     import torch
 
     gpu = re.sub(r"[^A-Za-z0-9]+", "-", torch.cuda.get_device_name(0)).strip("-").lower()
-    return os.path.join(cache_dir, f"uvq1p5_fp32_{gpu}_trt{trt.__version__}.engine")
+    return os.path.join(cache_dir, f"uvq1p5_fp32_b{max_batch}_{gpu}_trt{trt.__version__}.engine")
 
 
 def ensure_engine(onnx_path, cache_dir, max_batch=8):
     """Returns a TensorRT engine for this GPU, building and caching it if needed."""
     os.makedirs(cache_dir, exist_ok=True)
-    path = engine_path_for(cache_dir)
+    path = engine_path_for(cache_dir, max_batch)
     if os.path.exists(path):
         return path
     log.info("Building a TensorRT engine for this GPU (once; takes a few minutes) -> %s", path)
@@ -73,9 +73,21 @@ def ensure_engine(onnx_path, cache_dir, max_batch=8):
     return path
 
 
+def smoke_test(engine):
+    """Runs one black frame through the model, so a broken setup fails at startup, not on a segment."""
+    import torch
+
+    frame = torch.zeros(1, uvq1p5_trt.VIDEO_HEIGHT, uvq1p5_trt.VIDEO_WIDTH, uvq1p5_trt.VIDEO_CHANNELS, dtype=torch.uint8)
+    with torch.inference_mode():
+        score = float(engine(frame).float().cpu().reshape(-1)[0])
+    if not 1.0 <= score <= 5.0:  # NaN fails this too
+        raise RuntimeError(f"test frame scored {score}, outside UVQ's 1-5 range")
+
+
 class Scorer:
     def __init__(self, device="auto", onnx_path=None, engine_path=None, engine_cache_dir=None,
-                 fps=None, threads=None, batch_size=None, transpose="auto", ffmpeg_path="ffmpeg"):
+                 fps=None, threads=None, batch_size=None, transpose="auto", ffmpeg_path="ffmpeg", max_batch=8):
+        self.requested = device
         available, reason = gpu_status()
         if device == "auto":
             device = "gpu" if available else "cpu"
@@ -85,12 +97,19 @@ class Scorer:
             raise SystemExit(f"--device gpu, but {reason}")
         self.device = device
         if device == "gpu":
-            engine_path = engine_path or ensure_engine(onnx_path, engine_cache_dir)
-            self.engine = uvq1p5_trt.TRTEngine(engine_path)
-            self.backend = f"TensorRT on {reason}"
-            self.model = os.path.basename(engine_path)
-        else:
+            try:
+                self._load_gpu(onnx_path, engine_path, engine_cache_dir, max_batch, reason)
+            except Exception as e:
+                # e.g. a GPU generation TensorRT doesn't support, or too little GPU memory for the batch size
+                hint = (f"(too little GPU memory? try --max_batch {max(1, max_batch // 2)})"
+                        if max_batch > 1 else "(GPU not supported by TensorRT?)")
+                if self.requested == "gpu":
+                    raise SystemExit(f"--device gpu, but the GPU can't run UVQ {hint}: {e}")
+                log.warning("GPU unusable for UVQ %s; falling back to the CPU. Cause: %s", hint, str(e)[-1500:])
+                device = self.device = "cpu"
+        if device == "cpu":
             self.engine = uvq1p5_trt.ORTEngine(onnx_path, threads)
+            smoke_test(self.engine)
             self.backend = f"ONNX Runtime on CPU ({threads or os.cpu_count()} threads)"
             self.model = os.path.basename(onnx_path)
         self.fps = fps or DEFAULT_FPS[device]
@@ -98,6 +117,15 @@ class Scorer:
         self.transpose = transpose
         self.ffmpeg_path = ffmpeg_path
         log.info("Scoring with %s, %d frame(s) per second, batches of %d", self.backend, self.fps, self.batch_size)
+
+    def _load_gpu(self, onnx_path, engine_path, cache_dir, max_batch, gpu_name):
+        if max_batch < 1:
+            raise ValueError("--max_batch must be at least 1")
+        engine_path = engine_path or ensure_engine(onnx_path, cache_dir, max_batch)
+        self.engine = uvq1p5_trt.TRTEngine(engine_path)
+        smoke_test(self.engine)
+        self.backend = f"TensorRT on {gpu_name}"
+        self.model = os.path.basename(engine_path)
 
     def is_portrait(self, path):
         out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
