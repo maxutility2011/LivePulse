@@ -1,0 +1,46 @@
+# LivePulse on one host: an ingestor and a processor for one stream.
+#   docker compose up -d --build
+#   send SRT to srt://<host>:9000, then open http://<host>:8000/ (UVQ chart)
+#   and http://<host>:8080/cam1/index.m3u8 (HLS).
+# Add one ingestor + processor pair per stream (own ports and stream_id).
+services:
+  ingestor-cam1:
+    build: ./ingestor
+    image: livepulse-ingestor
+    command: >-
+      --input_url "srt://0.0.0.0?latency=500000" --port 9000
+      --stream_id cam1 --segment_seconds 6
+    ports:
+      - "9000:9000/udp"
+      - "8080:80"
+    tmpfs:
+      - /tmp/lp_storage
+    restart: unless-stopped
+
+  processor-cam1:
+    build: ./processor
+    image: livepulse-processor
+    command: >-
+      --input_url http://ingestor-cam1/cam1/index.m3u8
+      --stream_id cam1 --output /data/cam1_scores.jsonl
+    ports:
+      - "8000:8000"
+    volumes:
+      - lp-engines:/var/cache/livepulse   # TensorRT engines, built once per GPU
+      - lp-data:/data                     # scores for the monitor
+    depends_on:
+      - ingestor-cam1
+    restart: unless-stopped
+    # Use the GPU when the host has one (NVIDIA Container Toolkit); remove this
+    # block on CPU-only hosts.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  lp-engines:
+  lp-data:

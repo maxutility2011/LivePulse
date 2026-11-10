@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+README.md
+docker-compose.yml
+# Local UVQ checkout and generated models: the image fetches/exports its own.
+uvq_trt/uvq/
+uvq_trt/engines/
+*.onnx
+*.engine
+*.cache
+*.txt
+!requirements.txt
+!uvq_trt/requirements.txt

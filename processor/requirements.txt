@@ -1,0 +1,5 @@
+# torch / torchvision come from the PyTorch index (see Dockerfile), and on GPU
+# hosts tensorrt-cu12>=10.8,<11 too. These are the rest:
+numpy
+onnx>=1.16
+onnxruntime>=1.18

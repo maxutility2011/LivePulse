@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LivePulse · UVQ</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --series-1: #2a78d6;
+    --critical: #d03b3b;
+    --good: #0ca30c;
+    --warning: #fab219;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface-1: #1a1a19;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --series-1: #3987e5;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  .meta { color: var(--text-secondary); font-size: 13px; overflow-wrap: anywhere; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+          padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-1); }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+  .pill.live .dot { background: var(--good); }
+  .pill.stale .dot { background: var(--warning); }
+  .pill.down .dot { background: var(--critical); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; }
+  .tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+  .tile .sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+  .tile.hero .value { font-size: 34px; }
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 14px 10px; }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .toolbar h2 { font-size: 15px; margin: 0 auto 0 0; font-weight: 600; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { font: inherit; font-size: 13px; padding: 4px 10px; border: 0; background: transparent;
+                color: var(--text-secondary); cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: var(--page); color: var(--text-primary); font-weight: 600; }
+  .chart-box { position: relative; height: 380px; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+         border-radius: 8px; padding: 6px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+         white-space: nowrap; }
+  .tip b { font-size: 14px; }
+  .tip .muted, .muted { color: var(--text-muted); }
+  .note { color: var(--text-muted); font-size: 12px; margin: 6px 2px 0; }
+  .table-card { margin-top: 16px; }
+  .table-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--text-secondary); font-weight: 600; }
+  .low { color: var(--critical); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="title">LivePulse · UVQ</h1>
+    <span class="pill" id="conn"><span class="dot"></span><span id="conn-text">Connecting…</span></span>
+    <span class="meta" id="meta"></span>
+  </header>
+
+  <section class="tiles" aria-label="Current quality">
+    <div class="tile hero"><div class="label">Latest frame</div><div class="value" id="t-last">–</div><div class="sub" id="t-last-time">&nbsp;</div></div>
+    <div class="tile"><div class="label">Latest segment mean</div><div class="value" id="t-seg">–</div><div class="sub" id="t-seg-name">&nbsp;</div></div>
+    <div class="tile"><div class="label" id="t-win-label">Window mean</div><div class="value" id="t-win">–</div><div class="sub" id="t-win-min">&nbsp;</div></div>
+    <div class="tile"><div class="label">Delay after publish</div><div class="value" id="t-lat">–</div><div class="sub" id="t-lat-sub">&nbsp;</div></div>
+    <div class="tile"><div class="label">Segments</div><div class="value" id="t-count">–</div><div class="sub" id="t-count-sub">&nbsp;</div></div>
+  </section>
+
+  <section class="card">
+    <div class="toolbar">
+      <h2>UVQ 1.5 score per frame</h2>
+      <div class="seg" role="group" aria-label="Time window" id="windows">
+        <button data-w="60">1 min</button><button data-w="300" aria-pressed="true">5 min</button>
+        <button data-w="900">15 min</button><button data-w="3600">1 h</button>
+      </div>
+      <div class="seg" role="group" aria-label="Score axis" id="scales">
+        <button data-s="full" aria-pressed="true">Scale 1–5</button><button data-s="fit">Fit to data</button>
+      </div>
+      <div class="seg"><button id="follow" aria-pressed="true">Follow live</button></div>
+    </div>
+    <div class="chart-box" id="box">
+      <canvas id="chart" role="img" aria-label="Line chart of UVQ score per frame over time"></canvas>
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <p class="note" id="note">UVQ scores range from 1 (bad) to 5 (excellent).</p>
+  </section>
+
+  <section class="card table-card">
+    <div class="toolbar"><h2>Recent segments</h2></div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Segment</th><th>Frames</th><th>Mean</th><th>Min</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+"use strict";
+const KEEP_SECONDS = 3600;          // history kept in the browser
+const frames = [];                  // {id, t, s, seq}
+const segments = [];                // summaries from the server
+let status = {};
+let windowSec = 300, follow = true, viewEnd = null, scaleMode = "full";
+let lastFrameId = 0, lastSegId = 0, lastUpdate = 0;
+const $ = (id) => document.getElementById(id);
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+const fmtTime = (t) => new Date(t * 1000).toLocaleTimeString([], {hour12: false});
+const fmtScore = (s) => (s == null ? "–" : s.toFixed(2));
+
+function addFrames(list) {
+  for (const [id, t, s, seq] of list) { frames.push({id, t, s, seq}); lastFrameId = id; }
+  const cutoff = frames.length ? frames[frames.length - 1].t - KEEP_SECONDS : 0;
+  let drop = 0;
+  while (drop < frames.length && frames[drop].t < cutoff) drop++;
+  if (drop) frames.splice(0, drop);
+}
+function addSegments(list) {
+  for (const s of list) { segments.push(s); lastSegId = s.id; }
+  if (segments.length > 2000) segments.splice(0, segments.length - 2000);
+}
+
+// ---------------------------------------------------------------- tiles & table
+function renderText() {
+  const low = status.low_score ?? 3;
+  if (status.stream_id) { $("title").textContent = `LivePulse · ${status.stream_id}`; document.title = `UVQ · ${status.stream_id}`; }
+  if (status.phase) $("meta").textContent = `${status.phase} · ${status.input_url || ""}`;
+  else if (status.backend) $("meta").textContent = `${status.backend} · ${status.fps} frame${status.fps == 1 ? "" : "s"}/s · ${status.input_url}`;
+  const last = frames[frames.length - 1];
+  $("t-last").textContent = fmtScore(last?.s);
+  $("t-last").className = "value" + (last && last.s < low ? " low" : "");
+  $("t-last-time").textContent = last ? fmtTime(last.t) : " ";
+  const seg = segments[segments.length - 1];
+  $("t-seg").textContent = fmtScore(seg?.mean);
+  $("t-seg-name").textContent = seg ? `${seg.name} · ${seg.frames} frames` : " ";
+  const end = last ? last.t : 0, inWin = frames.filter((f) => f.t >= end - windowSec);
+  const mean = inWin.length ? inWin.reduce((a, f) => a + f.s, 0) / inWin.length : null;
+  const min = inWin.length ? Math.min(...inWin.map((f) => f.s)) : null;
+  $("t-win-label").textContent = `Mean, last ${labelFor(windowSec)}`;
+  $("t-win").textContent = fmtScore(mean);
+  $("t-win-min").textContent = min == null ? " " : `min ${fmtScore(min)} · ${inWin.length} frames`;
+  $("t-lat").textContent = status.last_latency == null ? "–" : `${status.last_latency.toFixed(1)} s`;
+  $("t-lat-sub").textContent = status.last_scoring_seconds == null ? " " : `from playlist to score · scoring ${status.last_scoring_seconds.toFixed(2)} s`;
+  const c = status.counts || {};
+  $("t-count").textContent = c.ok ?? "–";
+  $("t-count-sub").textContent = `${c.skipped || 0} skipped · ${c.error || 0} errors · backlog ${status.backlog ?? 0}`;
+  $("note").textContent = `UVQ scores range from 1 (bad) to 5 (excellent). The red line marks the low-quality threshold (${low}).`;
+
+  const rows = $("rows");
+  rows.textContent = "";
+  for (const s of segments.slice(-15).reverse()) {
+    const tr = document.createElement("tr");
+    const cells = [fmtTime(s.start), s.name + (s.discontinuity ? " (discontinuity)" : ""), s.frames, fmtScore(s.mean), fmtScore(s.min)];
+    cells.forEach((v, i) => {
+      const td = document.createElement("td");
+      td.textContent = v;
+      if ((i === 3 && s.mean < low) || (i === 4 && s.min < low)) td.className = "low";
+      tr.appendChild(td);
+    });
+    rows.appendChild(tr);
+  }
+}
+const labelFor = (w) => (w >= 3600 ? `${w / 3600} h` : `${w / 60} min`);
+
+// ---------------------------------------------------------------- chart
+const canvas = $("chart"), ctx = canvas.getContext("2d"), box = $("box"), tip = $("tip");
+const pad = {l: 40, r: 16, t: 12, b: 28};
+let geom = null, hoverX = null, drawQueued = false;
+
+function queueDraw() { if (!drawQueued) { drawQueued = true; requestAnimationFrame(draw); } }
+
+function niceStep(span) {
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+  return steps.find((s) => span / s <= 8) || 3600;
+}
+
+function draw() {
+  drawQueued = false;
+  const dpr = window.devicePixelRatio || 1, w = box.clientWidth, h = box.clientHeight;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const latest = frames.length ? frames[frames.length - 1].t : Date.now() / 1000;
+  const x1 = follow || viewEnd == null ? latest : viewEnd, x0 = x1 - windowSec;
+  const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
+  const X = (t) => pad.l + ((t - x0) / (x1 - x0)) * pw;
+  // y: UVQ's full 1..5 range, or fitted to the visible scores to show small changes
+  const visible = [];
+  for (const f of frames) if (f.t >= x0 - 2 && f.t <= x1 + 2) visible.push(f);
+  let y0 = 1, y1 = 5, ystep = 1;
+  if (scaleMode === "fit" && visible.length) {
+    let lo = Infinity, hi = -Infinity;
+    for (const f of visible) { if (f.s < lo) lo = f.s; if (f.s > hi) hi = f.s; }
+    const span = Math.max(hi - lo, 0.05);
+    ystep = [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1].find((s) => span / s <= 6) || 1;
+    y0 = Math.max(1, Math.floor((lo - span * 0.1) / ystep) * ystep);
+    y1 = Math.min(5, Math.ceil((hi + span * 0.1) / ystep) * ystep);
+    if (y1 - y0 < ystep) y1 = y0 + ystep;
+  }
+  const Y = (s) => pad.t + (1 - (s - y0) / (y1 - y0)) * ph;
+  geom = {x0, x1, X, Y, pw, ph, w, h};
+  const ink = css("--text-muted"), grid = css("--grid"), axis = css("--axis");
+  ctx.font = "12px system-ui, -apple-system, 'Segoe UI', sans-serif";
+
+  // grid + y ticks
+  const decimals = ystep >= 1 ? 0 : ystep >= 0.1 ? 1 : 2;
+  ctx.lineWidth = 1; ctx.fillStyle = ink; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let i = 0; y0 + i * ystep <= y1 + 1e-9; i++) {
+    const s = y0 + i * ystep, y = Math.round(Y(s)) + 0.5;
+    ctx.strokeStyle = i === 0 ? axis : grid;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    ctx.fillText(s.toFixed(decimals), pad.l - 8, y);
+  }
+  // x ticks
+  const step = niceStep(windowSec);
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let t = Math.ceil(x0 / step) * step; t <= x1; t += step) {
+    const x = Math.round(X(t)) + 0.5;
+    ctx.strokeStyle = axis; ctx.beginPath(); ctx.moveTo(x, pad.t + ph); ctx.lineTo(x, pad.t + ph + 4); ctx.stroke();
+    ctx.fillText(fmtTime(t), x, pad.t + ph + 7);
+  }
+  // threshold (reference line + label: never color alone)
+  const low = status.low_score ?? 3;
+  ctx.fillStyle = css("--text-secondary"); ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+  if (low >= y0 && low <= y1) {
+    const yl = Math.round(Y(low)) + 0.5;
+    ctx.strokeStyle = css("--critical"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, yl); ctx.lineTo(w - pad.r, yl); ctx.stroke();
+    ctx.fillText(`low quality < ${low}`, pad.l + 6, yl - 3);
+  } else {
+    ctx.fillText(`low-quality threshold ${low} is ${low < y0 ? "below" : "above"} this range`, pad.l + 6, pad.t + ph - 4);
+  }
+
+  // series: 2px line, broken at gaps (skipped segments, reconnects)
+  const gap = Math.max(3, 3 / (status.fps || 1));
+  ctx.save();
+  ctx.beginPath(); ctx.rect(pad.l, pad.t - 2, pw, ph + 4); ctx.clip();
+  ctx.strokeStyle = css("--series-1"); ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.beginPath();
+  let prev = null;
+  for (const f of visible) {
+    const x = X(f.t), y = Y(Math.max(y0, Math.min(y1, f.s)));
+    if (!prev || f.t - prev.t > gap) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    prev = f;
+  }
+  ctx.stroke();
+  // sparse data: show the points themselves
+  if (visible.length && pw / visible.length > 12) {
+    ctx.fillStyle = css("--series-1");
+    for (const f of visible) { ctx.beginPath(); ctx.arc(X(f.t), Y(f.s), 3, 0, 2 * Math.PI); ctx.fill(); }
+  }
+  ctx.restore();
+
+  if (!frames.length) {
+    ctx.fillStyle = ink; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(status.phase || "Waiting for the first scored segment…", pad.l + pw / 2, pad.t + ph / 2);
+  }
+  drawHover(visible);
+}
+
+function drawHover(visible) {
+  if (hoverX == null || !visible.length) { tip.hidden = true; return; }
+  const {X, Y, x0, x1, pw} = geom;
+  const t = x0 + ((hoverX - pad.l) / pw) * (x1 - x0);
+  let best = visible[0];
+  for (const f of visible) if (Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
+  const x = X(best.t), y = Y(best.s);
+  ctx.strokeStyle = css("--axis"); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, pad.t); ctx.lineTo(Math.round(x) + 0.5, pad.t + geom.ph); ctx.stroke();
+  ctx.fillStyle = css("--surface-1"); ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI); ctx.fill();
+  ctx.fillStyle = css("--series-1"); ctx.beginPath(); ctx.arc(x, y, 4, 0, 2 * Math.PI); ctx.fill();
+  const seg = segments.find((s) => s.seq === best.seq);
+  tip.innerHTML = "";
+  const b = document.createElement("b"); b.textContent = `UVQ ${best.s.toFixed(3)}`;
+  const line1 = document.createElement("div"); line1.className = "muted"; line1.textContent = fmtTime(best.t);
+  const line2 = document.createElement("div"); line2.className = "muted";
+  line2.textContent = seg ? `${seg.name} · segment mean ${seg.mean.toFixed(3)}` : `segment #${best.seq}`;
+  tip.append(b, line1, line2);
+  tip.hidden = false;
+  const tw = tip.offsetWidth, left = x + 14 + tw > geom.w ? x - 14 - tw : x + 14;
+  tip.style.left = `${left}px`; tip.style.top = `${Math.max(0, y - 30)}px`;
+}
+
+box.addEventListener("pointermove", (e) => { const r = box.getBoundingClientRect(); hoverX = e.clientX - r.left; queueDraw(); });
+box.addEventListener("pointerleave", () => { hoverX = null; queueDraw(); });
+new ResizeObserver(queueDraw).observe(box);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", queueDraw);
+
+$("windows").addEventListener("click", (e) => {
+  const btn = e.target.closest("button"); if (!btn) return;
+  windowSec = Number(btn.dataset.w);
+  for (const b of $("windows").children) b.setAttribute("aria-pressed", String(b === btn));
+  renderText(); queueDraw();
+});
+$("scales").addEventListener("click", (e) => {
+  const btn = e.target.closest("button"); if (!btn) return;
+  scaleMode = btn.dataset.s;
+  for (const b of $("scales").children) b.setAttribute("aria-pressed", String(b === btn));
+  queueDraw();
+});
+$("follow").addEventListener("click", () => {
+  follow = !follow;
+  viewEnd = frames.length ? frames[frames.length - 1].t : null;
+  $("follow").setAttribute("aria-pressed", String(follow));
+  queueDraw();
+});
+
+// Initial view from the URL, e.g. /?window=900&scale=fit (handy for wall displays)
+(() => {
+  const q = new URLSearchParams(location.search);
+  const w = q.get("window"), s = q.get("scale");
+  if (w) { const b = [...$("windows").children].find((x) => x.dataset.w === w); if (b) b.click(); }
+  if (s) { const b = [...$("scales").children].find((x) => x.dataset.s === s); if (b) b.click(); }
+})();
+
+// ---------------------------------------------------------------- data feed
+function setConn(kind, text) { $("conn").className = `pill ${kind}`; $("conn-text").textContent = text; }
+
+async function start() {
+  try {
+    const state = await (await fetch(`api/state?window=${KEEP_SECONDS}`, {cache: "no-store"})).json();
+    status = state.status || {};
+    addFrames(state.frames); addSegments(state.segments);
+    lastFrameId = state.last_frame_id; lastSegId = state.last_segment_id;
+  } catch (e) { setConn("down", "Processor unreachable"); }
+  renderText(); queueDraw();
+  const es = new EventSource(`events?after=${lastFrameId}&seg_after=${lastSegId}`);
+  es.addEventListener("open", () => setConn("live", "Live"));
+  es.addEventListener("error", () => setConn("down", "Reconnecting…"));
+  es.addEventListener("update", (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.status) status = msg.status;
+    if (msg.frames.length) { addFrames(msg.frames); lastUpdate = Date.now(); }
+    if (msg.segments.length) addSegments(msg.segments);
+    setConn("live", "Live");
+    renderText(); queueDraw();
+  });
+  // "Stale" when no new scores arrive for 3 segment lengths.
+  setInterval(() => {
+    const segLen = segments.length ? segments[segments.length - 1].end - segments[segments.length - 1].start : 6;
+    if (lastUpdate && Date.now() - lastUpdate > Math.max(20000, segLen * 3000) && $("conn").className.includes("live"))
+      setConn("stale", "No new scores");
+  }, 2000);
+}
+start();
+</script>
+</body>
+</html>

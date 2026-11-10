@@ -1,210 +1,231 @@
-"""LivePulse processor: scores ingested segments with UVQ 1.5.
+"""LivePulse processor: UVQ 1.5 quality scores for a live HLS stream, with a real-time web UI.
 
-Follows the segments.jsonl manifest written by ingestor/lp_ingestor.py and
-scores every new segment with Google's UVQ 1.5 model, on an NVIDIA GPU with
-TensorRT (--engine) or on the CPU with ONNX Runtime (--onnx); see
-uvq_trt/README.md for building those. The model is loaded once. Each segment
-gives one JSON line in the scores file (default <segments_dir>/scores.jsonl),
-which the monitor (monitor/lp_monitor.py) follows:
-
-    {"stream": "cam1", "segment": "seg_..._00004.mp4", "status": "ok",
-     "uvq1p5_score": 4.62, "finished_at": "...", "scored_at": "...", ...}
-
-status is "ok", "error" (segment unreadable or deleted) or "skipped"
-(dropped by --max_backlog). Segments already in the scores file are not
-scored again, so the processor can be restarted at any time.
+Takes the URL of an HLS variant playlist (e.g. the ingestor's output), downloads
+segment after segment, prepends the init segment to every fMP4 media segment
+so it decodes on its own, and scores its frames with Google's UVQ 1.5 model -
+on the GPU with TensorRT when one is available, otherwise on the CPU with ONNX
+Runtime. UVQ samples --fps frames per second: 5 on the GPU, 1 on the CPU by
+default. Scores are pushed to the web UI (--http_port) batch by batch as they
+are computed, and optionally appended per segment to a JSON-lines file
+(--output) for the monitor.
 
 Examples:
-    python processor/lp_processor.py live/cam1 --engine processor/uvq_trt/uvq1p5_fp32.engine
-    python processor/lp_processor.py live/cam1 --onnx processor/uvq_trt/uvq1p5.onnx --max_backlog 6
+  python processor/lp_processor.py --input_url http://ingestor/cam1/index.m3u8
+  python processor/lp_processor.py --input_url https://storage.googleapis.com/bucket/live/cam1/index.m3u8 \\
+      --device cpu --output /data/cam1_scores.jsonl
 """
 
 import argparse
-import collections
 import datetime
 import json
+import logging
 import os
+import queue
+import shutil
+import signal
+import statistics
 import sys
+import threading
 import time
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "uvq_trt"))
-import uvq1p5_trt  # noqa: E402
-import uvq_trt_inference  # noqa: E402
+sys.path.insert(0, HERE)
+from hls_reader import HlsReader  # noqa: E402
+from scorer import Scorer  # noqa: E402
+from webui import ScoreStore, serve  # noqa: E402
 
-MANIFEST_NAME = "segments.jsonl"
-SCORES_NAME = "scores.jsonl"
+log = logging.getLogger("processor")
 
 
-def parse_args():
+def first_existing(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return paths[-1]
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="\n\n".join(__doc__.split("\n\n")[1:]),
     )
-    parser.add_argument("segments_dir", help="Ingestor --out_dir (holds the segments and segments.jsonl)")
-    backend = parser.add_mutually_exclusive_group(required=True)
-    backend.add_argument("--engine", help="TensorRT engine: score on the GPU")
-    backend.add_argument("--onnx", help="ONNX file from uvq_trt/export_onnx.py: score on the CPU")
-    parser.add_argument("--output", default=None, help="Scores file (default <segments_dir>/scores.jsonl)")
-    parser.add_argument(
-        "--max_backlog", type=int, default=0,
-        help="If more than N segments wait for scoring, skip the oldest so scores stay current (0 = never skip)",
-    )
-    parser.add_argument("--max_segments", type=int, default=0, help="Stop after scoring N segments (0 = run forever)")
-    parser.add_argument("--poll_interval", type=float, default=0.5, help="Seconds between manifest checks")
-    score = parser.add_argument_group("UVQ options (as in uvq_trt/uvq_trt_inference.py)")
-    score.add_argument("--uvq_dir", default=uvq1p5_trt.DEFAULT_UVQ_DIR, help="Path to a google/uvq checkout")
-    score.add_argument("--fps", type=int, default=1, help="Frames scored per second; -1 = all (default 1)")
-    score.add_argument(
-        "--transpose", choices=["auto", "on", "off"], default="auto",
-        help="Transpose frames before scoring; auto = for portrait video (default auto)",
-    )
-    score.add_argument("--batch_size", type=int, default=None, help="Frames per batch (default: engine max / 1)")
-    score.add_argument("--threads", type=int, default=None, help="CPU threads for --onnx (default: all cores)")
-    score.add_argument("--hwaccel", default=None, help="FFmpeg -hwaccel for decoding segments")
-    score.add_argument("--ffmpeg_path", default="ffmpeg")
-    score.add_argument("--ffprobe_path", default="ffprobe")
-    args = parser.parse_args()
-    if args.output is None:
-        args.output = os.path.join(args.segments_dir, SCORES_NAME)
+    parser.add_argument("--input_url", required=True, help="HLS variant (media) playlist URL; a master playlist works too")
+    parser.add_argument("--stream_id", default=None, help="Stream name in the UI and output (default: from the URL)")
+    dev = parser.add_argument_group("scoring")
+    dev.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto",
+                     help="auto = GPU (TensorRT) when available, else CPU (ONNX Runtime)")
+    dev.add_argument("--fps", type=int, default=None,
+                     help="Frames UVQ samples per second of video (default 5 on GPU, 1 on CPU); "
+                          "e.g. 5 = every 5th frame of a 25 fps stream")
+    dev.add_argument("--onnx", default=first_existing(os.environ.get("LP_ONNX"), "/opt/livepulse/models/uvq1p5.onnx",
+                                                      os.path.join(HERE, "uvq_trt", "uvq1p5.onnx")),
+                     help="UVQ 1.5 ONNX model (from uvq_trt/export_onnx.py)")
+    dev.add_argument("--engine", default=None, help="TensorRT engine to use instead of building/caching one")
+    dev.add_argument("--engine_cache_dir",
+                     default=os.environ.get("LP_ENGINE_CACHE") or ("/var/cache/livepulse" if os.path.isdir("/opt/livepulse")
+                                                                   else os.path.join(HERE, "uvq_trt", "engines")),
+                     help="Where GPU-specific TensorRT engines are built and cached")
+    dev.add_argument("--threads", type=int, default=None, help="CPU threads for ONNX Runtime (default: all cores)")
+    dev.add_argument("--batch_size", type=int, default=None, help="Frames per inference batch (default 8 GPU / 1 CPU)")
+    dev.add_argument("--transpose", choices=["auto", "on", "off"], default="auto",
+                     help="Transpose frames before scoring; auto = for portrait video")
+    flow = parser.add_argument_group("stream handling")
+    flow.add_argument("--max_backlog", type=int, default=3,
+                      help="If more than N segments wait for scoring, skip the oldest to stay live (0 = never skip)")
+    flow.add_argument("--live_edge_segments", type=int, default=3, help="Start this many segments behind the live edge")
+    flow.add_argument("--max_segments", type=int, default=0, help="Stop after scoring N segments (0 = run forever)")
+    out = parser.add_argument_group("output")
+    out.add_argument("--http_host", default="0.0.0.0", help="Web UI bind address")
+    out.add_argument("--http_port", type=int, default=8000, help="Web UI port (0 = no web UI; default 8000)")
+    out.add_argument("--low_score", type=float, default=3.0, help="Threshold line drawn in the UI (default 3.0)")
+    out.add_argument("--output", default="", help="Append one JSON line per scored segment (monitor input)")
+    out.add_argument("--history_frames", type=int, default=200_000, help="Frame scores kept in memory for the UI")
+    parser.add_argument("--ffmpeg_path", default="ffmpeg")
+    parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    args = parser.parse_args(argv)
+    if args.stream_id is None:
+        parts = [p for p in urllib.parse.urlparse(args.input_url).path.split("/") if p]
+        args.stream_id = parts[-2] if len(parts) >= 2 else (parts[-1] if parts else "stream")
     return args
 
 
-def log(message):
-    print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
-
-
-class JsonlTail:
-    """Yields new complete JSON lines appended to a file, across polls."""
-
-    def __init__(self, path):
-        self.path = path
-        self.offset = 0
-        self.partial = b""
-
-    def read_new(self):
-        try:
-            with open(self.path, "rb") as f:
-                f.seek(self.offset)
-                data = f.read()
-        except FileNotFoundError:
-            return []
-        self.offset += len(data)
-        lines = (self.partial + data).split(b"\n")
-        self.partial = lines.pop()  # incomplete last line, if any
-        records = []
-        for line in lines:
-            if line.strip():
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    log(f"Ignoring malformed line in {self.path}: {line[:80]!r}")
-        return records
+def iso(t):
+    return datetime.datetime.fromtimestamp(t).isoformat(timespec="milliseconds")
 
 
 class Processor:
-    def __init__(self, args):
+    def __init__(self, args, scorer, store):
         self.args = args
-        if args.onnx:
-            self.engine = uvq1p5_trt.ORTEngine(args.onnx, args.threads)
-            self.backend = "onnxruntime-cpu"
-            model = args.onnx
-        else:
-            import torch
+        self.scorer = scorer
+        self.store = store
+        self.reader = HlsReader(args.input_url, live_edge_segments=args.live_edge_segments)
+        self.pending = queue.Queue()
+        self.counts = {"ok": 0, "skipped": 0, "error": 0}
+        self.stopping = threading.Event()
 
-            if not torch.cuda.is_available():
-                raise SystemExit("--engine needs a CUDA GPU and a CUDA build of torch (use --onnx for the CPU)")
-            self.engine = uvq1p5_trt.TRTEngine(args.engine)
-            self.backend = "tensorrt-gpu"
-            model = args.engine
-        if args.batch_size is None:
-            args.batch_size = self.engine.default_batch_size
-        log(f"Scoring with {self.backend} ({os.path.basename(model)})")
-        self.done = self.already_scored()
-        self.pending = collections.deque()
-        self.scored = 0
-
-    def already_scored(self):
-        done = set()
-        for record in JsonlTail(self.args.output).read_new():
-            done.add((record.get("stream"), record.get("segment")))
-        if done:
-            log(f"{len(done)} segments already in {self.args.output}; they won't be scored again")
-        return done
-
-    def transpose_for(self, path):
-        if self.args.transpose == "auto":
-            return uvq_trt_inference.is_portrait(path, self.args.ffprobe_path)
-        return self.args.transpose == "on"
-
-    def write(self, entry, status, **fields):
-        record = {
-            "stream": entry.get("stream"),
-            "segment": entry["segment"],
-            "status": status,
-            "finished_at": entry.get("finished_at"),
-            "duration": entry.get("duration"),
-            "scored_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "model": "uvq1p5",
-            "backend": self.backend,
-            **fields,
-        }
-        with open(self.args.output, "a") as f:
-            f.write(json.dumps(record) + "\n")
-        self.done.add((entry.get("stream"), entry["segment"]))
-
-    def score(self, entry):
-        path = os.path.join(self.args.segments_dir, entry["segment"])
-        name = entry["segment"]
-        if not os.path.exists(path):
-            log(f"{name}: file is gone (deleted by the ingestor's --keep_duration?)")
-            self.write(entry, "error", error="segment file not found")
-            return
-        start = time.time()
+    def read_loop(self):
         try:
-            transpose = self.transpose_for(path)
-            results = uvq_trt_inference.score_video(self.engine, path, self.args, transpose)
-        except Exception as e:  # a bad segment must not stop the processor
-            log(f"{name}: scoring failed: {e}")
-            self.write(entry, "error", error=str(e))
+            for seg in self.reader.segments():
+                self.pending.put(seg)
+        finally:
+            self.pending.put(None)
+
+    def write_record(self, record):
+        if self.args.output:
+            with open(self.args.output, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+    def record(self, seg, status, **fields):
+        return {"stream": self.args.stream_id, "segment": seg.name, "seq": seg.seq, "status": status,
+                "start": iso(seg.start), "finished_at": iso(seg.start + seg.duration), "duration": seg.duration,
+                "scored_at": iso(time.time()), "model": "uvq1p5", "device": self.scorer.device,
+                "backend": self.scorer.backend, "fps": self.scorer.fps, **fields}
+
+    def publish_status(self, **extra):
+        self.store.update_status(stream_id=self.args.stream_id, input_url=self.args.input_url,
+                                 device=self.scorer.device, backend=self.scorer.backend, fps=self.scorer.fps,
+                                 low_score=self.args.low_score, counts=dict(self.counts),
+                                 backlog=self.pending.qsize(), **extra)
+
+    def score_segment(self, seg):
+        started = time.time()
+        times, scores = [], []
+        try:
+            for first, batch in self.scorer.score(seg.path):
+                t = [seg.start + (first + i) / self.scorer.fps for i in range(len(batch))]
+                self.store.add_frames(t, batch, seg.seq)  # live: pushed to the UI right away
+                times += t
+                scores += batch.tolist()
+        except Exception as e:
+            log.warning("%s: scoring failed: %s", seg.name, e)
+            self.counts["error"] += 1
+            self.write_record(self.record(seg, "error", error=str(e)))
             return
-        elapsed = time.time() - start
-        results.pop("video_name", None)
-        self.write(entry, "ok", transpose=transpose, scoring_seconds=round(elapsed, 3), **results)
-        self.scored += 1
-        slow = "  (slower than real time)" if entry.get("duration") and elapsed > entry["duration"] else ""
-        log(f"{entry.get('stream')}/{name}  UVQ {results['uvq1p5_score']:.4f}  "
-            f"[{len(results['per_frame_scores'])} frames in {elapsed:.1f}s, backlog {len(self.pending)}]{slow}")
+        finally:
+            try:
+                os.remove(seg.path)
+            except OSError:
+                pass
+        elapsed = time.time() - started
+        if not scores:
+            self.counts["error"] += 1
+            self.write_record(self.record(seg, "error", error="no frames decoded"))
+            log.warning("%s: no frames decoded", seg.name)
+            return
+        self.counts["ok"] += 1
+        mean = statistics.fmean(scores)
+        latency = time.time() - seg.playlist_seen_at  # from appearing in the playlist to scored
+        self.store.add_segment({"seq": seg.seq, "name": seg.name, "start": round(seg.start, 3),
+                                "end": round(seg.start + seg.duration, 3), "mean": round(mean, 4),
+                                "min": round(min(scores), 4), "frames": len(scores),
+                                "discontinuity": seg.discontinuity})
+        self.write_record(self.record(seg, "ok", uvq1p5_score=mean, per_frame_scores=scores,
+                                      frame_times=[iso(t) for t in times], scoring_seconds=round(elapsed, 3),
+                                      delay_seconds=round(latency, 3)))
+        self.publish_status(last_segment=seg.name, last_score=round(mean, 4), last_latency=round(latency, 2),
+                            last_scoring_seconds=round(elapsed, 3))
+        slow = "  (slower than real time)" if elapsed > seg.duration else ""
+        log.info("%s  UVQ %.4f  [%d frames in %.2fs, scored %.1fs after it was published, backlog %d]%s",
+                 seg.name, mean, len(scores), elapsed, latency, self.pending.qsize(), slow)
 
     def run(self):
-        manifest = JsonlTail(os.path.join(self.args.segments_dir, MANIFEST_NAME))
-        log(f"Following {manifest.path} -> {self.args.output}")
-        while True:
-            for entry in manifest.read_new():
-                if "segment" in entry and (entry.get("stream"), entry["segment"]) not in self.done:
-                    self.pending.append(entry)
-            if not self.pending:
-                time.sleep(self.args.poll_interval)
+        reader = threading.Thread(target=self.read_loop, name="hls-reader", daemon=True)
+        reader.start()
+        self.publish_status(started_at=iso(time.time()))
+        while not self.stopping.is_set():
+            try:
+                seg = self.pending.get(timeout=0.5)
+            except queue.Empty:
                 continue
-            while self.args.max_backlog and len(self.pending) > self.args.max_backlog:
-                entry = self.pending.popleft()
-                log(f"Behind by {len(self.pending) + 1} segments: skipping {entry['segment']}")
-                self.write(entry, "skipped")
-            self.score(self.pending.popleft())
-            if self.args.max_segments and self.scored >= self.args.max_segments:
-                return
+            if seg is None:
+                log.info("Input ended")
+                break
+            while self.args.max_backlog and self.pending.qsize() > self.args.max_backlog:
+                log.warning("Behind by %d segments: skipping %s", self.pending.qsize() + 1, seg.name)
+                self.counts["skipped"] += 1
+                self.write_record(self.record(seg, "skipped"))
+                os.remove(seg.path)
+                seg = self.pending.get()
+                if seg is None:
+                    return
+            self.score_segment(seg)
+            if self.args.max_segments and self.counts["ok"] >= self.args.max_segments:
+                break
+
+    def stop(self):
+        self.stopping.set()
+        self.reader.stop()
 
 
-def main():
-    args = parse_args()
-    uvq1p5_trt.add_uvq_to_path(args.uvq_dir)
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    processor = Processor(args)
+def main(argv=None):
+    args = parse_args(argv)
+    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stdout)
+    if not os.path.exists(args.onnx) and not args.engine:
+        raise SystemExit(f"UVQ ONNX model not found: {args.onnx} (export it with uvq_trt/export_onnx.py)")
+    # The UI comes up first: loading the model (or building a TensorRT engine) can take minutes.
+    store = ScoreStore(max_frames=args.history_frames)
+    store.update_status(stream_id=args.stream_id, input_url=args.input_url, low_score=args.low_score,
+                        phase="Loading the UVQ model (a TensorRT engine is built on first start on a GPU)")
+    if args.http_port:
+        serve(store, args.http_host, args.http_port)
+    scorer = Scorer(args.device, args.onnx, args.engine, args.engine_cache_dir, args.fps, args.threads,
+                    args.batch_size, args.transpose, args.ffmpeg_path)
+    store.update_status(phase=None)
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    processor = Processor(args, scorer, store)
+    log.info("Input: %s (stream '%s')", args.input_url, args.stream_id)
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         processor.run()
     except KeyboardInterrupt:
-        log("Stopping (Ctrl+C)")
-    log(f"Scored {processor.scored} segments this run")
+        log.info("Stopping...")
+    processor.stop()
+    shutil.rmtree(processor.reader.workdir, ignore_errors=True)
+    log.info("Scored %d segments (%d skipped, %d errors)", processor.counts["ok"],
+             processor.counts["skipped"], processor.counts["error"])
 
 
 if __name__ == "__main__":
